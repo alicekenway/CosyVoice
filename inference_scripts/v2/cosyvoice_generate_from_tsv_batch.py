@@ -57,15 +57,22 @@ def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, dat
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        # New layout: inference_scripts/ and cosyvoice/ are siblings.
+        if (parent / "inference_scripts").is_dir() and (parent / "cosyvoice").is_dir():
+            return parent
+    raise RuntimeError("Unable to locate project root containing inference_scripts/ and cosyvoice/")
 
 
 def prepare_import_path() -> None:
     root = repo_root()
-    cosyvoice_root = root / "CosyVoice"
+    cosyvoice_root = root
     matcha_root = cosyvoice_root / "third_party" / "Matcha-TTS"
-    sys.path.insert(0, str(cosyvoice_root))
-    sys.path.insert(0, str(matcha_root))
+    if str(cosyvoice_root) not in sys.path:
+        sys.path.insert(0, str(cosyvoice_root))
+    if str(matcha_root) not in sys.path:
+        sys.path.insert(0, str(matcha_root))
 
 
 def parse_args() -> argparse.Namespace:
@@ -206,7 +213,7 @@ def main() -> None:
     from cosyvoice.cli.cosyvoice import AutoModel  # pylint: disable=import-outside-toplevel
     import hyperpyyaml  # pylint: disable=import-outside-toplevel
     import ruamel.yaml  # pylint: disable=import-outside-toplevel
-    matcha_root = repo_root() / "CosyVoice" / "third_party" / "Matcha-TTS"
+    matcha_root = repo_root() / "third_party" / "Matcha-TTS"
 
     # region agent log
     _debug_log(
