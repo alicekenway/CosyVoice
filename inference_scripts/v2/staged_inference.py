@@ -105,6 +105,7 @@ class StagedBatchInferenceRunner:
         self.max_token_text_ratio = max_token_text_ratio
         self.flow_n_timesteps = flow_n_timesteps
 
+    @torch.inference_mode()
     def run_batch(self, prepared_rows: Sequence[PreparedRow]) -> List[SynthesisResult]:
         segment_tasks: List[SegmentTask] = []
         for row_index, prepared_row in enumerate(prepared_rows):
