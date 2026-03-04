@@ -1,11 +1,5 @@
 from dataclasses import dataclass
-import json
-import os
-from pathlib import Path
-import time
 from typing import Dict, List, Sequence, Tuple
-import urllib.error
-import urllib.request
 
 import numpy as np
 import torch
@@ -15,68 +9,6 @@ from torch.nn.utils.rnn import pad_sequence
 from batch_types import PreparedRow, SegmentInput, SynthesisResult
 from frontend_batch import collate_segment_inputs
 from io_utils import chunked
-
-DEBUG_LOG_PATH = Path(
-    os.environ.get(
-        "COSYVOICE_DEBUG_LOG_PATH",
-        "/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-2b9202.log",
-    )
-)
-DEBUG_SESSION_ID = "2b9202"
-DEBUG_SERVER_ENDPOINT = "http://127.0.0.1:7686/ingest/409ba5f4-ff70-4548-96c8-a6f2ad82f1ac"
-
-
-def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict) -> None:
-    payload = {
-        "sessionId": DEBUG_SESSION_ID,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        return
-    except Exception:
-        pass
-    try:
-        request = urllib.request.Request(
-            DEBUG_SERVER_ENDPOINT,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "X-Debug-Session-Id": DEBUG_SESSION_ID,
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=1):
-            pass
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        pass
-
-
-def _cuda_memory_snapshot() -> Dict:
-    if not torch.cuda.is_available():
-        return {"cuda_available": False}
-    try:
-        device_index = torch.cuda.current_device()
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
-        return {
-            "cuda_available": True,
-            "device_index": int(device_index),
-            "allocated_bytes": int(torch.cuda.memory_allocated(device_index)),
-            "reserved_bytes": int(torch.cuda.memory_reserved(device_index)),
-            "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device_index)),
-            "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device_index)),
-            "free_bytes": int(free_bytes),
-            "total_bytes": int(total_bytes),
-        }
-    except Exception as exc:  # pylint: disable=broad-except
-        return {"cuda_available": True, "snapshot_error": str(exc)}
-
 
 @dataclass(frozen=True)
 class SegmentTask:
@@ -117,26 +49,6 @@ class StagedBatchInferenceRunner:
                         segment_input=segment_input,
                     )
                 )
-
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H2",
-            location="staged_inference.py:run_batch:start",
-            message="run_batch shape and memory summary",
-            data={
-                "prepared_rows": len(prepared_rows),
-                "segment_tasks": len(segment_tasks),
-                "llm_batch_size": self.llm_batch_size,
-                "flow_batch_size": self.flow_batch_size,
-                "min_token_text_ratio": self.min_token_text_ratio,
-                "max_token_text_ratio": self.max_token_text_ratio,
-                "flow_n_timesteps": self.flow_n_timesteps,
-                "grad_enabled": bool(torch.is_grad_enabled()),
-                "cuda_memory": _cuda_memory_snapshot(),
-            },
-        )
-        # endregion
 
         row_errors: Dict[int, str] = {}
         generated_tokens: Dict[Tuple[int, int], List[int]] = {}
@@ -186,22 +98,6 @@ class StagedBatchInferenceRunner:
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 error_message = f"Flow/HiFi stage failed: {exc}"
-                # region agent log
-                _debug_log(
-                    run_id="pre-fix",
-                    hypothesis_id="H4",
-                    location="staged_inference.py:run_batch:flow_exception",
-                    message="flow stage raised exception",
-                    data={
-                        "error": str(exc),
-                        "error_type": exc.__class__.__name__,
-                        "active_tasks": len(active_tasks),
-                        "active_token_lengths": [len(token_ids) for token_ids in active_tokens],
-                        "grad_enabled": bool(torch.is_grad_enabled()),
-                        "cuda_memory": _cuda_memory_snapshot(),
-                    },
-                )
-                # endregion
                 if self.on_error == "raise":
                     raise RuntimeError(error_message) from exc
                 for task in active_tasks:
@@ -258,23 +154,6 @@ class StagedBatchInferenceRunner:
         )
 
         llm_module = self.model.llm
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H1",
-            location="staged_inference.py:_run_llm_stage_batch:capabilities",
-            message="llm module capabilities",
-            data={
-                "llm_module_class": llm_module.__class__.__name__,
-                "has_llm": hasattr(llm_module, "llm"),
-                "has_llm_decoder": hasattr(llm_module, "llm_decoder"),
-                "has_forward_one_step": hasattr(llm_module.llm, "forward_one_step") if hasattr(llm_module, "llm") else False,
-                "has_llm_model_attr": hasattr(llm_module.llm, "model") if hasattr(llm_module, "llm") else False,
-                "grad_enabled": bool(torch.is_grad_enabled()),
-                "cuda_memory": _cuda_memory_snapshot(),
-            },
-        )
-        # endregion
         if not hasattr(llm_module, "llm") or not hasattr(llm_module, "llm_decoder"):
             raise RuntimeError("Current LLM module does not support strict batch decode")
         if not hasattr(llm_module, "speech_embedding"):
@@ -311,19 +190,6 @@ class StagedBatchInferenceRunner:
                 f"Unsupported strict-batch LLM backend: {llm_module.__class__.__name__}"
             )
 
-        # region agent log
-        _debug_log(
-            run_id="post-fix",
-            hypothesis_id="H2",
-            location="staged_inference.py:_run_llm_stage_batch:backend_path",
-            message="selected llm strict batch backend path",
-            data={
-                "uses_transformer_path": uses_transformer_path,
-                "uses_qwen_path": uses_qwen_path,
-            },
-        )
-        # endregion
-
         sos_emb = token_table[llm_module.sos].reshape(1, 1, -1)
         task_id_emb = token_table[llm_module.task_id].reshape(1, 1, -1)
 
@@ -349,21 +215,6 @@ class StagedBatchInferenceRunner:
             dtype=torch.long,
             device=self.model.device,
         )
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H2",
-            location="staged_inference.py:_run_llm_stage_batch:input_shapes",
-            message="llm batched input shape summary",
-            data={
-                "batch_size": batch_size,
-                "lm_input_max_len": int(lm_input_len.max().item()),
-                "lm_input_len": [int(item) for item in lm_input_len.detach().cpu().tolist()],
-                "text_len": [int(item) for item in text_len.detach().cpu().tolist()],
-            },
-        )
-        # endregion
-
         min_len = ((text_len.to(torch.float32)) * self.min_token_text_ratio).to(torch.long)
         max_len = ((text_len.to(torch.float32)) * self.max_token_text_ratio).to(torch.long)
         max_decode_steps = int(max_len.max().item())
@@ -421,15 +272,6 @@ class StagedBatchInferenceRunner:
             if not active_mask.any():
                 break
 
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H5",
-            location="staged_inference.py:_run_llm_stage_batch:decode_result",
-            message="llm batched decode result lengths",
-            data={"token_lengths": [len(token_seq) for token_seq in generated_tokens]},
-        )
-        # endregion
         for token_sequence in generated_tokens:
             if not token_sequence:
                 raise RuntimeError("LLM generated zero speech tokens for at least one sample")
@@ -447,22 +289,6 @@ class StagedBatchInferenceRunner:
             [SegmentInput(normalized_text="", model_input=item) for item in model_inputs]
         )
         flow_module = self.model.flow
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H3",
-            location="staged_inference.py:_run_flow_hift_stage_batch:capabilities",
-            message="flow module capabilities",
-            data={
-                "flow_module_class": flow_module.__class__.__name__,
-                "has_input_embedding": hasattr(flow_module, "input_embedding"),
-                "has_decoder": hasattr(flow_module, "decoder"),
-                "decoder_estimator_type": flow_module.decoder.estimator.__class__.__name__ if hasattr(flow_module, "decoder") else "",
-                "grad_enabled": bool(torch.is_grad_enabled()),
-                "cuda_memory": _cuda_memory_snapshot(),
-            },
-        )
-        # endregion
         if not all(token_ids_list):
             raise RuntimeError("Token ids list contains empty sequence")
 
@@ -556,21 +382,6 @@ class StagedBatchInferenceRunner:
         mel_mask = (~make_pad_mask(mel_total_len, max_len=max_mel_len)).unsqueeze(1).to(h)
         mu = h.transpose(1, 2).contiguous()
         cond = conds.transpose(1, 2).contiguous()
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H6",
-            location="staged_inference.py:_run_flow_hift_stage_batch:pre_cfm",
-            message="flow pre-cfm tensor summary",
-            data={
-                "mu_shape": list(mu.shape),
-                "mask_shape": list(mel_mask.shape),
-                "cond_shape": list(cond.shape),
-                "token_len": [int(item) for item in gen_token_len.detach().cpu().tolist()],
-                "mel_total_len": [int(item) for item in mel_total_len.detach().cpu().tolist()],
-            },
-        )
-        # endregion
         flow_feat = self._batched_cfm_decode(
             decoder=flow_module.decoder,
             mu=mu,
@@ -599,19 +410,6 @@ class StagedBatchInferenceRunner:
         )
         for batch_index, sample_mel in enumerate(generated_mels):
             mel_batch[batch_index, :, : sample_mel.shape[2]] = sample_mel[0]
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H8",
-            location="staged_inference.py:_run_flow_hift_stage_batch:pre_hift",
-            message="flow output mel batch summary",
-            data={
-                "mel_batch_shape": list(mel_batch.shape),
-                "generated_mel_len": [int(item) for item in generated_mel_len],
-            },
-        )
-        # endregion
-
         speech_batch, _ = self.model.hift.inference(speech_feat=mel_batch)
         sample_per_frame = self._infer_sample_per_mel_frame()
 
@@ -622,18 +420,6 @@ class StagedBatchInferenceRunner:
             output_speeches.append(
                 speech_batch[batch_index : batch_index + 1, :expected_speech_len].cpu()
             )
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H5",
-            location="staged_inference.py:_run_flow_hift_stage_batch:output_lengths",
-            message="flow+hift output lengths",
-            data={
-                "generated_mel_len": [int(item) for item in generated_mel_len],
-                "speech_output_len": [int(item.shape[1]) for item in output_speeches],
-            },
-        )
-        # endregion
         return output_speeches
 
     def _batched_cfm_decode(
@@ -651,23 +437,6 @@ class StagedBatchInferenceRunner:
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if getattr(decoder, "t_scheduler", "") == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H7",
-            location="staged_inference.py:_batched_cfm_decode:start",
-            message="cfm decode start summary",
-            data={
-                "batch_size": batch_size,
-                "n_timesteps": n_timesteps,
-                "mu_shape": list(mu.shape),
-                "spks_shape": list(spks.shape),
-                "grad_enabled": bool(torch.is_grad_enabled()),
-                "cuda_memory": _cuda_memory_snapshot(),
-            },
-        )
-        # endregion
-
         x = z
         t = t_span[0].unsqueeze(0)
         dt = t_span[1] - t_span[0]
@@ -692,20 +461,6 @@ class StagedBatchInferenceRunner:
             dphi_dt = (1.0 + decoder.inference_cfg_rate) * dphi_dt_main - decoder.inference_cfg_rate * dphi_dt_cfg
             x = x + dt * dphi_dt
             t = t + dt
-            if step in (1, n_timesteps):
-                # region agent log
-                _debug_log(
-                    run_id="pre-fix",
-                    hypothesis_id="H7",
-                    location="staged_inference.py:_batched_cfm_decode:step",
-                    message="cfm decode step reached",
-                    data={
-                        "step": step,
-                        "x_shape": list(x.shape),
-                        "cuda_memory": _cuda_memory_snapshot(),
-                    },
-                )
-                # endregion
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
         return x.float()

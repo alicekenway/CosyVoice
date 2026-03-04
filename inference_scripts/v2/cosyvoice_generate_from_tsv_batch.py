@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import json
-import os
 import sys
-import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Dict, List
 
@@ -19,48 +14,6 @@ from batch_types import PreparedRow, SynthesisResult, TsvInputRow
 from frontend_batch import CrossLingualBatchPreparer
 from io_utils import LANG_TOKEN_MAP, chunked, load_rows, write_failures, write_metadata
 from staged_inference import StagedBatchInferenceRunner
-
-DEBUG_LOG_PATH = Path(
-    os.environ.get(
-        "COSYVOICE_DEBUG_LOG_PATH",
-        "/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-2b9202.log",
-    )
-)
-DEBUG_SESSION_ID = "2b9202"
-DEBUG_SERVER_ENDPOINT = "http://127.0.0.1:7686/ingest/409ba5f4-ff70-4548-96c8-a6f2ad82f1ac"
-
-
-def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict) -> None:
-    payload = {
-        "sessionId": DEBUG_SESSION_ID,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        return
-    except Exception:
-        pass
-    try:
-        request = urllib.request.Request(
-            DEBUG_SERVER_ENDPOINT,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "X-Debug-Session-Id": DEBUG_SESSION_ID,
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=1):
-            pass
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        pass
-
 
 def repo_root() -> Path:
     current = Path(__file__).resolve()
@@ -219,24 +172,6 @@ def main() -> None:
     from cosyvoice.cli.cosyvoice import AutoModel  # pylint: disable=import-outside-toplevel
     import hyperpyyaml  # pylint: disable=import-outside-toplevel
     import ruamel.yaml  # pylint: disable=import-outside-toplevel
-    matcha_root = repo_root() / "third_party" / "Matcha-TTS"
-
-    # region agent log
-    _debug_log(
-        run_id="pre-fix",
-        hypothesis_id="H1",
-        location="cosyvoice_generate_from_tsv_batch.py:main:env_probe",
-        message="yaml/hyperpyyaml environment probe",
-        data={
-            "hyperpyyaml_version": getattr(hyperpyyaml, "__version__", "unknown"),
-            "ruamel_yaml_version": getattr(ruamel.yaml, "__version__", "unknown"),
-            "has_loader_max_depth": hasattr(ruamel.yaml.Loader, "max_depth"),
-            "model_path": args.model_path,
-            "matcha_root_exists": matcha_root.exists(),
-            "matcha_root_entries": len(list(matcha_root.glob("*"))) if matcha_root.exists() else -1,
-        },
-    )
-    # endregion
     if not hasattr(ruamel.yaml.Loader, "max_depth"):
         ruamel.yaml.Loader.max_depth = None
     if hasattr(ruamel.yaml, "SafeLoader") and not hasattr(ruamel.yaml.SafeLoader, "max_depth"):
@@ -245,18 +180,6 @@ def main() -> None:
         ruamel.yaml.FullLoader.max_depth = None
     if hasattr(ruamel.yaml, "UnsafeLoader") and not hasattr(ruamel.yaml.UnsafeLoader, "max_depth"):
         ruamel.yaml.UnsafeLoader.max_depth = None
-    # region agent log
-    _debug_log(
-        run_id="post-fix",
-        hypothesis_id="H1",
-        location="cosyvoice_generate_from_tsv_batch.py:main:yaml_monkey_patch",
-        message="applied ruamel loader max_depth compatibility patch",
-        data={
-            "loader_has_max_depth_after_patch": hasattr(ruamel.yaml.Loader, "max_depth"),
-            "loader_max_depth_value": getattr(ruamel.yaml.Loader, "max_depth", "missing"),
-        },
-    )
-    # endregion
 
     input_tsv_path = Path(args.input_tsv).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -274,15 +197,6 @@ def main() -> None:
     try:
         cosyvoice = AutoModel(model_dir=str(Path(args.model_path).expanduser().resolve()))
     except Exception as exc:  # pylint: disable=broad-except
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H1",
-            location="cosyvoice_generate_from_tsv_batch.py:main:automodel_exception",
-            message="AutoModel construction failed",
-            data={"error": str(exc), "error_type": exc.__class__.__name__},
-        )
-        # endregion
         raise
     lang_token = LANG_TOKEN_MAP[args.lang] if args.lang else ""
     preparer = CrossLingualBatchPreparer(
