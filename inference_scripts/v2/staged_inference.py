@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import time
 from typing import Dict, List, Sequence, Tuple
@@ -15,7 +16,12 @@ from batch_types import PreparedRow, SegmentInput, SynthesisResult
 from frontend_batch import collate_segment_inputs
 from io_utils import chunked
 
-DEBUG_LOG_PATH = Path("/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-2b9202.log")
+DEBUG_LOG_PATH = Path(
+    os.environ.get(
+        "COSYVOICE_DEBUG_LOG_PATH",
+        "/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-2b9202.log",
+    )
+)
 DEBUG_SESSION_ID = "2b9202"
 DEBUG_SERVER_ENDPOINT = "http://127.0.0.1:7686/ingest/409ba5f4-ff70-4548-96c8-a6f2ad82f1ac"
 
