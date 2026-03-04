@@ -19,8 +19,8 @@ from frontend_batch import CrossLingualBatchPreparer
 from io_utils import LANG_TOKEN_MAP, chunked, load_rows, write_failures, write_metadata
 from staged_inference import StagedBatchInferenceRunner
 
-DEBUG_LOG_PATH = Path("/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-e6d17b.log")
-DEBUG_SESSION_ID = "e6d17b"
+DEBUG_LOG_PATH = Path("/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-2b9202.log")
+DEBUG_SESSION_ID = "2b9202"
 DEBUG_SERVER_ENDPOINT = "http://127.0.0.1:7686/ingest/409ba5f4-ff70-4548-96c8-a6f2ad82f1ac"
 
 

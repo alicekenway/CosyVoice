@@ -15,8 +15,8 @@ from batch_types import PreparedRow, SegmentInput, SynthesisResult
 from frontend_batch import collate_segment_inputs
 from io_utils import chunked
 
-DEBUG_LOG_PATH = Path("/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-e6d17b.log")
-DEBUG_SESSION_ID = "e6d17b"
+DEBUG_LOG_PATH = Path("/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-2b9202.log")
+DEBUG_SESSION_ID = "2b9202"
 DEBUG_SERVER_ENDPOINT = "http://127.0.0.1:7686/ingest/409ba5f4-ff70-4548-96c8-a6f2ad82f1ac"
 
 
@@ -52,6 +52,26 @@ def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, dat
         pass
 
 
+def _cuda_memory_snapshot() -> Dict:
+    if not torch.cuda.is_available():
+        return {"cuda_available": False}
+    try:
+        device_index = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        return {
+            "cuda_available": True,
+            "device_index": int(device_index),
+            "allocated_bytes": int(torch.cuda.memory_allocated(device_index)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device_index)),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device_index)),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device_index)),
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+        }
+    except Exception as exc:  # pylint: disable=broad-except
+        return {"cuda_available": True, "snapshot_error": str(exc)}
+
+
 @dataclass(frozen=True)
 class SegmentTask:
     row_index: int
@@ -80,22 +100,6 @@ class StagedBatchInferenceRunner:
         self.flow_n_timesteps = flow_n_timesteps
 
     def run_batch(self, prepared_rows: Sequence[PreparedRow]) -> List[SynthesisResult]:
-        # region agent log
-        _debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H4",
-            location="staged_inference.py:run_batch:start",
-            message="run_batch called",
-            data={
-                "prepared_rows": len(prepared_rows),
-                "llm_batch_size": self.llm_batch_size,
-                "flow_batch_size": self.flow_batch_size,
-                "min_token_text_ratio": self.min_token_text_ratio,
-                "max_token_text_ratio": self.max_token_text_ratio,
-                "flow_n_timesteps": self.flow_n_timesteps,
-            },
-        )
-        # endregion
         segment_tasks: List[SegmentTask] = []
         for row_index, prepared_row in enumerate(prepared_rows):
             for segment_index, segment_input in enumerate(prepared_row.segment_inputs):
@@ -106,6 +110,26 @@ class StagedBatchInferenceRunner:
                         segment_input=segment_input,
                     )
                 )
+
+        # region agent log
+        _debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H2",
+            location="staged_inference.py:run_batch:start",
+            message="run_batch shape and memory summary",
+            data={
+                "prepared_rows": len(prepared_rows),
+                "segment_tasks": len(segment_tasks),
+                "llm_batch_size": self.llm_batch_size,
+                "flow_batch_size": self.flow_batch_size,
+                "min_token_text_ratio": self.min_token_text_ratio,
+                "max_token_text_ratio": self.max_token_text_ratio,
+                "flow_n_timesteps": self.flow_n_timesteps,
+                "grad_enabled": bool(torch.is_grad_enabled()),
+                "cuda_memory": _cuda_memory_snapshot(),
+            },
+        )
+        # endregion
 
         row_errors: Dict[int, str] = {}
         generated_tokens: Dict[Tuple[int, int], List[int]] = {}
@@ -155,6 +179,22 @@ class StagedBatchInferenceRunner:
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 error_message = f"Flow/HiFi stage failed: {exc}"
+                # region agent log
+                _debug_log(
+                    run_id="pre-fix",
+                    hypothesis_id="H4",
+                    location="staged_inference.py:run_batch:flow_exception",
+                    message="flow stage raised exception",
+                    data={
+                        "error": str(exc),
+                        "error_type": exc.__class__.__name__,
+                        "active_tasks": len(active_tasks),
+                        "active_token_lengths": [len(token_ids) for token_ids in active_tokens],
+                        "grad_enabled": bool(torch.is_grad_enabled()),
+                        "cuda_memory": _cuda_memory_snapshot(),
+                    },
+                )
+                # endregion
                 if self.on_error == "raise":
                     raise RuntimeError(error_message) from exc
                 for task in active_tasks:
@@ -223,6 +263,8 @@ class StagedBatchInferenceRunner:
                 "has_llm_decoder": hasattr(llm_module, "llm_decoder"),
                 "has_forward_one_step": hasattr(llm_module.llm, "forward_one_step") if hasattr(llm_module, "llm") else False,
                 "has_llm_model_attr": hasattr(llm_module.llm, "model") if hasattr(llm_module, "llm") else False,
+                "grad_enabled": bool(torch.is_grad_enabled()),
+                "cuda_memory": _cuda_memory_snapshot(),
             },
         )
         # endregion
@@ -409,6 +451,8 @@ class StagedBatchInferenceRunner:
                 "has_input_embedding": hasattr(flow_module, "input_embedding"),
                 "has_decoder": hasattr(flow_module, "decoder"),
                 "decoder_estimator_type": flow_module.decoder.estimator.__class__.__name__ if hasattr(flow_module, "decoder") else "",
+                "grad_enabled": bool(torch.is_grad_enabled()),
+                "cuda_memory": _cuda_memory_snapshot(),
             },
         )
         # endregion
@@ -611,6 +655,8 @@ class StagedBatchInferenceRunner:
                 "n_timesteps": n_timesteps,
                 "mu_shape": list(mu.shape),
                 "spks_shape": list(spks.shape),
+                "grad_enabled": bool(torch.is_grad_enabled()),
+                "cuda_memory": _cuda_memory_snapshot(),
             },
         )
         # endregion
@@ -649,6 +695,7 @@ class StagedBatchInferenceRunner:
                     data={
                         "step": step,
                         "x_shape": list(x.shape),
+                        "cuda_memory": _cuda_memory_snapshot(),
                     },
                 )
                 # endregion
