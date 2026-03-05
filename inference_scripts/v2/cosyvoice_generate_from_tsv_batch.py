@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -153,6 +154,20 @@ def prepare_batch_rows(
     return prepared_rows, failure_rows
 
 
+def speech_duration_sec(speech, sample_rate: int) -> float:
+    if speech.ndim < 2:
+        raise ValueError(f"Expected speech tensor with shape [channels, samples], got {tuple(speech.shape)}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    return float(speech.shape[1]) / float(sample_rate)
+
+
+def safe_rtf(runtime_sec: float, audio_sec: float) -> float:
+    if audio_sec <= 0.0:
+        return float("inf")
+    return runtime_sec / audio_sec
+
+
 def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
@@ -217,8 +232,12 @@ def main() -> None:
 
     metadata_rows: List[Dict[str, str]] = []
     failure_rows: List[Dict[str, str]] = []
+    total_runtime_sec = 0.0
+    total_audio_sec = 0.0
+    successful_batch_count = 0
 
-    for row_batch in chunked(rows, args.batch_size):
+    for batch_index, row_batch in enumerate(chunked(rows, args.batch_size), start=1):
+        batch_start_time = time.perf_counter()
         prepared_rows, frontend_failures = prepare_batch_rows(
             row_batch=row_batch,
             preparer=preparer,
@@ -228,8 +247,11 @@ def main() -> None:
         if not prepared_rows:
             continue
 
+        batch_success_count = 0
+        batch_audio_sec = 0.0
         for result in runner.run_batch(prepared_rows):
             if result.is_success:
+                item_audio_sec = speech_duration_sec(result.speech, cosyvoice.sample_rate)
                 metadata_rows.append(
                     save_result(
                         result=result,
@@ -237,6 +259,8 @@ def main() -> None:
                         sample_rate=cosyvoice.sample_rate,
                     )
                 )
+                batch_success_count += 1
+                batch_audio_sec += item_audio_sec
             else:
                 if args.on_error == "raise":
                     raise RuntimeError(
@@ -251,12 +275,47 @@ def main() -> None:
                     }
                 )
 
+        batch_runtime_sec = time.perf_counter() - batch_start_time
+        if batch_success_count > 0:
+            batch_rtf = safe_rtf(batch_runtime_sec, batch_audio_sec)
+            batch_avg_time_sec = batch_runtime_sec / batch_success_count
+            batch_avg_audio_sec = batch_audio_sec / batch_success_count
+            batch_avg_rtf = safe_rtf(batch_avg_time_sec, batch_avg_audio_sec)
+            print(
+                f"[batch {batch_index}] size={len(row_batch)}, success={batch_success_count}, "
+                f"time_sec={batch_runtime_sec:.3f}, audio_sec={batch_audio_sec:.3f}, "
+                f"rtf={batch_rtf:.4f}, avg_time_sec={batch_avg_time_sec:.3f}, "
+                f"avg_audio_sec={batch_avg_audio_sec:.3f}, avg_rtf={batch_avg_rtf:.4f}"
+            )
+            total_runtime_sec += batch_runtime_sec
+            total_audio_sec += batch_audio_sec
+            successful_batch_count += 1
+
     write_metadata(output_tsv_path, metadata_rows)
     write_failures(failed_tsv_path, failure_rows)
+
+    overall_rtf = safe_rtf(total_runtime_sec, total_audio_sec)
+    overall_avg_time_sec = total_runtime_sec / len(metadata_rows) if metadata_rows else 0.0
+    overall_avg_audio_sec = total_audio_sec / len(metadata_rows) if metadata_rows else 0.0
+    overall_avg_batch_time_sec = (
+        total_runtime_sec / successful_batch_count if successful_batch_count else 0.0
+    )
+    overall_avg_batch_audio_sec = (
+        total_audio_sec / successful_batch_count if successful_batch_count else 0.0
+    )
+    overall_avg_batch_rtf = safe_rtf(overall_avg_batch_time_sec, overall_avg_batch_audio_sec)
 
     print(f"Input rows: {len(rows)}")
     print(f"Generated utterances: {len(metadata_rows)}")
     print(f"Failed rows: {len(failure_rows)}")
+    print(
+        f"Overall timing: total_time_sec={total_runtime_sec:.3f}, "
+        f"total_audio_sec={total_audio_sec:.3f}, overall_rtf={overall_rtf:.4f}, "
+        f"avg_time_sec={overall_avg_time_sec:.3f}, avg_audio_sec={overall_avg_audio_sec:.3f}, "
+        f"avg_batch_time_sec={overall_avg_batch_time_sec:.3f}, "
+        f"avg_batch_audio_sec={overall_avg_batch_audio_sec:.3f}, "
+        f"avg_batch_rtf={overall_avg_batch_rtf:.4f}"
+    )
     print(f"WAV directory: {wav_dir}")
     print(f"Metadata TSV: {output_tsv_path}")
     print(f"Failure TSV: {failed_tsv_path}")

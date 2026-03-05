@@ -2,6 +2,7 @@
 import argparse
 import csv
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -85,6 +86,20 @@ def _concat_segments(segments: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat(segments, dim=1)
 
 
+def _speech_duration_sec(speech: torch.Tensor, sample_rate: int) -> float:
+    if speech.ndim < 2:
+        raise ValueError(f"Expected speech tensor with shape [channels, samples], got {tuple(speech.shape)}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    return float(speech.shape[1]) / float(sample_rate)
+
+
+def _safe_rtf(runtime_sec: float, audio_sec: float) -> float:
+    if audio_sec <= 0.0:
+        return float("inf")
+    return runtime_sec / audio_sec
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Batch TTS generation with CosyVoice from TSV input."
@@ -136,8 +151,11 @@ def main() -> None:
     cosyvoice = AutoModel(model_dir=str(Path(args.model_path).expanduser().resolve()))
 
     metadata_rows: List[Dict[str, str]] = []
+    total_runtime_sec = 0.0
+    total_audio_sec = 0.0
     lang_token = LANG_TOKEN_MAP[args.lang] if args.lang else ""
     for i, row in enumerate(rows):
+        row_start_time = time.perf_counter()
         text = row["text"]
         if lang_token and not text.startswith(lang_token):
             text = f"{lang_token}{text}"
@@ -156,6 +174,15 @@ def main() -> None:
             segments.append(out["tts_speech"].cpu())
         speech = _concat_segments(segments)
         torchaudio.save(str(abs_speech_path), speech, cosyvoice.sample_rate)
+        row_runtime_sec = time.perf_counter() - row_start_time
+        row_audio_sec = _speech_duration_sec(speech, cosyvoice.sample_rate)
+        row_rtf = _safe_rtf(row_runtime_sec, row_audio_sec)
+        total_runtime_sec += row_runtime_sec
+        total_audio_sec += row_audio_sec
+        print(
+            f"[row {i + 1}/{len(rows)}] time_sec={row_runtime_sec:.3f}, "
+            f"audio_sec={row_audio_sec:.3f}, rtf={row_rtf:.4f}"
+        )
         metadata_rows.append({"speechpath": rel_speech_path, "text": text})
 
     with output_tsv.open("w", encoding="utf-8", newline="") as f:
@@ -163,7 +190,16 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(metadata_rows)
 
+    avg_runtime_sec = total_runtime_sec / len(metadata_rows) if metadata_rows else 0.0
+    avg_audio_sec = total_audio_sec / len(metadata_rows) if metadata_rows else 0.0
+    avg_rtf = _safe_rtf(total_runtime_sec, total_audio_sec)
+
     print(f"Generated {len(metadata_rows)} utterances")
+    print(
+        f"Overall timing: total_time_sec={total_runtime_sec:.3f}, "
+        f"total_audio_sec={total_audio_sec:.3f}, overall_rtf={avg_rtf:.4f}, "
+        f"avg_time_sec={avg_runtime_sec:.3f}, avg_audio_sec={avg_audio_sec:.3f}"
+    )
     print(f"WAV directory: {wav_dir}")
     print(f"Metadata TSV: {output_tsv}")
 
