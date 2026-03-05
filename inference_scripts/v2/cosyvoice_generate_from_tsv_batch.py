@@ -243,6 +243,7 @@ def main() -> None:
     save_futures: List[Tuple[int, Future[Dict[str, str]]]] = []
     failure_rows: List[Dict[str, str]] = []
     total_runtime_sec = 0.0
+    save_wait_sec = 0.0
     total_audio_sec = 0.0
     successful_batch_count = 0
     save_executor = ThreadPoolExecutor(max_workers=args.save_workers)
@@ -309,8 +310,11 @@ def main() -> None:
     finally:
         save_executor.shutdown(wait=True)
 
+    save_wait_start_time = time.perf_counter()
     for _, save_future in sorted(save_futures, key=lambda item: item[0]):
         metadata_rows.append(save_future.result())
+    save_wait_sec = time.perf_counter() - save_wait_start_time
+    total_runtime_sec += save_wait_sec
 
     write_metadata(output_tsv_path, metadata_rows)
     write_failures(failed_tsv_path, failure_rows)
@@ -333,6 +337,7 @@ def main() -> None:
         f"Overall timing: total_time_sec={total_runtime_sec:.3f}, "
         f"total_audio_sec={total_audio_sec:.3f}, overall_rtf={overall_rtf:.4f}, "
         f"avg_time_sec={overall_avg_time_sec:.3f}, avg_audio_sec={overall_avg_audio_sec:.3f}, "
+        f"save_wait_sec={save_wait_sec:.3f}, "
         f"avg_batch_time_sec={overall_avg_batch_time_sec:.3f}, "
         f"avg_batch_audio_sec={overall_avg_batch_audio_sec:.3f}, "
         f"avg_batch_rtf={overall_avg_batch_rtf:.4f}"
