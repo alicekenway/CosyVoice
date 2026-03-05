@@ -19,15 +19,20 @@ LANG_TOKEN_MAP = {
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "inference_scripts").is_dir() and (parent / "cosyvoice").is_dir():
+            return parent
+    raise RuntimeError("Unable to locate project root containing inference_scripts/ and cosyvoice/")
 
 
 def _prepare_import_path() -> None:
-    root = _repo_root()
-    cosyvoice_root = root / "CosyVoice"
+    cosyvoice_root = _repo_root()
     matcha_root = cosyvoice_root / "third_party" / "Matcha-TTS"
-    sys.path.insert(0, str(cosyvoice_root))
-    sys.path.insert(0, str(matcha_root))
+    if str(cosyvoice_root) not in sys.path:
+        sys.path.insert(0, str(cosyvoice_root))
+    if str(matcha_root) not in sys.path:
+        sys.path.insert(0, str(matcha_root))
 
 
 def _normalize_header(name: str) -> str:
