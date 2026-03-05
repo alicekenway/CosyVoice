@@ -220,57 +220,51 @@ class StagedBatchInferenceRunner:
         max_decode_steps = int(max_len.max().item())
 
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
-        active_mask = torch.ones(batch_size, dtype=torch.bool, device=self.model.device)
+        active_sample_indices = list(range(batch_size))
         stop_token_ids = getattr(llm_module, "stop_token_ids", [llm_module.eos_token])
         stop_token_set = set(int(token_id) for token_id in stop_token_ids)
         current_sequences = lm_input_list
 
         for decode_step in range(max_decode_steps):
-            padded_input = pad_sequence(current_sequences, batch_first=True, padding_value=0.0)
+            if not active_sample_indices:
+                break
+
+            active_sequences = [current_sequences[sample_index] for sample_index in active_sample_indices]
+            padded_input = pad_sequence(active_sequences, batch_first=True, padding_value=0.0)
             padded_len = torch.tensor(
-                [seq.shape[0] for seq in current_sequences],
+                [sequence.shape[0] for sequence in active_sequences],
                 dtype=torch.long,
                 device=self.model.device,
             )
             y_pred, _ = llm_module.llm(padded_input, padded_len)
             gather_index = (
                 (padded_len - 1)
-                .view(batch_size, 1, 1)
+                .view(len(active_sample_indices), 1, 1)
                 .expand(-1, 1, y_pred.shape[-1])
             )
             current_last_hidden = y_pred.gather(1, gather_index).squeeze(1)
             logp = llm_module.llm_decoder(current_last_hidden).log_softmax(dim=-1)
-            next_token_ids: List[int] = []
-
-            for batch_index in range(batch_size):
-                if not active_mask[batch_index]:
-                    next_token_ids.append(stop_token_ids[0])
-                    continue
-
-                ignore_eos = decode_step < int(min_len[batch_index].item())
+            next_active_sample_indices: List[int] = []
+            for active_batch_index, sample_index in enumerate(active_sample_indices):
+                ignore_eos = decode_step < int(min_len[sample_index].item())
                 top_token = llm_module.sampling_ids(
-                    logp[batch_index],
-                    generated_tokens[batch_index],
+                    logp[active_batch_index],
+                    generated_tokens[sample_index],
                     25,
                     ignore_eos=ignore_eos,
                 )
                 top_token_int = int(top_token.item()) if isinstance(top_token, torch.Tensor) else int(top_token)
                 if top_token_int in stop_token_set:
-                    active_mask[batch_index] = False
-                    next_token_ids.append(stop_token_ids[0])
                     continue
-                generated_tokens[batch_index].append(top_token_int)
+                generated_tokens[sample_index].append(top_token_int)
                 next_token_embed = llm_module.speech_embedding.weight[top_token_int : top_token_int + 1]
-                current_sequences[batch_index] = torch.cat(
-                    [current_sequences[batch_index], next_token_embed],
+                current_sequences[sample_index] = torch.cat(
+                    [current_sequences[sample_index], next_token_embed],
                     dim=0,
                 )
-                if len(generated_tokens[batch_index]) >= int(max_len[batch_index].item()):
-                    active_mask[batch_index] = False
-                next_token_ids.append(top_token_int)
-
-            if not active_mask.any():
-                break
+                if len(generated_tokens[sample_index]) < int(max_len[sample_index].item()):
+                    next_active_sample_indices.append(sample_index)
+            active_sample_indices = next_active_sample_indices
 
         for token_sequence in generated_tokens:
             if not token_sequence:
