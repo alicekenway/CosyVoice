@@ -241,6 +241,8 @@ class StagedBatchInferenceRunner:
 
             padded_input = sequence_buffer.index_select(0, active_sample_indices)
             padded_len = sequence_len.index_select(0, active_sample_indices)
+            active_max_len = int(padded_len.max().item())
+            padded_input = padded_input[:, :active_max_len, :]
             y_pred, _ = llm_module.llm(padded_input, padded_len)
             gather_index = (
                 (padded_len - 1)
