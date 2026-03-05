@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torchaudio
 
@@ -113,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         default="skip",
         help="Error policy for row-level failures (default: skip)",
     )
+    parser.add_argument(
+        "--save_workers",
+        type=int,
+        default=4,
+        help="Number of threads used to save wav files (default: 4)",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +189,8 @@ def main() -> None:
         raise ValueError("--max_token_text_ratio must be >= --min_token_text_ratio")
     if args.flow_n_timesteps <= 0:
         raise ValueError("--flow_n_timesteps must be positive")
+    if args.save_workers <= 0:
+        raise ValueError("--save_workers must be positive")
 
     prepare_import_path()
     from cosyvoice.cli.cosyvoice import AutoModel  # pylint: disable=import-outside-toplevel
@@ -231,65 +240,77 @@ def main() -> None:
     )
 
     metadata_rows: List[Dict[str, str]] = []
+    save_futures: List[Tuple[int, Future[Dict[str, str]]]] = []
     failure_rows: List[Dict[str, str]] = []
     total_runtime_sec = 0.0
     total_audio_sec = 0.0
     successful_batch_count = 0
+    save_executor = ThreadPoolExecutor(max_workers=args.save_workers)
 
-    for batch_index, row_batch in enumerate(chunked(rows, args.batch_size), start=1):
-        batch_start_time = time.perf_counter()
-        prepared_rows, frontend_failures = prepare_batch_rows(
-            row_batch=row_batch,
-            preparer=preparer,
-            on_error=args.on_error,
-        )
-        failure_rows.extend(frontend_failures)
-        if not prepared_rows:
-            continue
-
-        batch_success_count = 0
-        batch_audio_sec = 0.0
-        for result in runner.run_batch(prepared_rows):
-            if result.is_success:
-                item_audio_sec = speech_duration_sec(result.speech, cosyvoice.sample_rate)
-                metadata_rows.append(
-                    save_result(
-                        result=result,
-                        wav_dir=wav_dir,
-                        sample_rate=cosyvoice.sample_rate,
-                    )
-                )
-                batch_success_count += 1
-                batch_audio_sec += item_audio_sec
-            else:
-                if args.on_error == "raise":
-                    raise RuntimeError(
-                        f"Inference failed for row_id={result.row.row_id}: {result.error_message}"
-                    )
-                failure_rows.append(
-                    {
-                        "row_id": result.row.row_id,
-                        "text": result.row.text,
-                        "ref_audio": result.row.ref_audio_path,
-                        "error": result.error_message or "Unknown error",
-                    }
-                )
-
-        batch_runtime_sec = time.perf_counter() - batch_start_time
-        if batch_success_count > 0:
-            batch_rtf = safe_rtf(batch_runtime_sec, batch_audio_sec)
-            batch_avg_time_sec = batch_runtime_sec / batch_success_count
-            batch_avg_audio_sec = batch_audio_sec / batch_success_count
-            batch_avg_rtf = safe_rtf(batch_avg_time_sec, batch_avg_audio_sec)
-            print(
-                f"[batch {batch_index}] size={len(row_batch)}, success={batch_success_count}, "
-                f"time_sec={batch_runtime_sec:.3f}, audio_sec={batch_audio_sec:.3f}, "
-                f"rtf={batch_rtf:.4f}, avg_time_sec={batch_avg_time_sec:.3f}, "
-                f"avg_audio_sec={batch_avg_audio_sec:.3f}, avg_rtf={batch_avg_rtf:.4f}"
+    try:
+        for batch_index, row_batch in enumerate(chunked(rows, args.batch_size), start=1):
+            batch_start_time = time.perf_counter()
+            prepared_rows, frontend_failures = prepare_batch_rows(
+                row_batch=row_batch,
+                preparer=preparer,
+                on_error=args.on_error,
             )
-            total_runtime_sec += batch_runtime_sec
-            total_audio_sec += batch_audio_sec
-            successful_batch_count += 1
+            failure_rows.extend(frontend_failures)
+            if not prepared_rows:
+                continue
+
+            batch_success_count = 0
+            batch_audio_sec = 0.0
+            for result in runner.run_batch(prepared_rows):
+                if result.is_success:
+                    item_audio_sec = speech_duration_sec(result.speech, cosyvoice.sample_rate)
+                    save_futures.append(
+                        (
+                            result.row.output_index,
+                            save_executor.submit(
+                                save_result,
+                                result=result,
+                                wav_dir=wav_dir,
+                                sample_rate=cosyvoice.sample_rate,
+                            ),
+                        )
+                    )
+                    batch_success_count += 1
+                    batch_audio_sec += item_audio_sec
+                else:
+                    if args.on_error == "raise":
+                        raise RuntimeError(
+                            f"Inference failed for row_id={result.row.row_id}: {result.error_message}"
+                        )
+                    failure_rows.append(
+                        {
+                            "row_id": result.row.row_id,
+                            "text": result.row.text,
+                            "ref_audio": result.row.ref_audio_path,
+                            "error": result.error_message or "Unknown error",
+                        }
+                    )
+
+            batch_runtime_sec = time.perf_counter() - batch_start_time
+            if batch_success_count > 0:
+                batch_rtf = safe_rtf(batch_runtime_sec, batch_audio_sec)
+                batch_avg_time_sec = batch_runtime_sec / batch_success_count
+                batch_avg_audio_sec = batch_audio_sec / batch_success_count
+                batch_avg_rtf = safe_rtf(batch_avg_time_sec, batch_avg_audio_sec)
+                print(
+                    f"[batch {batch_index}] size={len(row_batch)}, success={batch_success_count}, "
+                    f"time_sec={batch_runtime_sec:.3f}, audio_sec={batch_audio_sec:.3f}, "
+                    f"rtf={batch_rtf:.4f}, avg_time_sec={batch_avg_time_sec:.3f}, "
+                    f"avg_audio_sec={batch_avg_audio_sec:.3f}, avg_rtf={batch_avg_rtf:.4f}"
+                )
+                total_runtime_sec += batch_runtime_sec
+                total_audio_sec += batch_audio_sec
+                successful_batch_count += 1
+    finally:
+        save_executor.shutdown(wait=True)
+
+    for _, save_future in sorted(save_futures, key=lambda item: item[0]):
+        metadata_rows.append(save_future.result())
 
     write_metadata(output_tsv_path, metadata_rows)
     write_failures(failed_tsv_path, failure_rows)

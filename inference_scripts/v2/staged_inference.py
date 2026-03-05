@@ -406,13 +406,14 @@ class StagedBatchInferenceRunner:
             mel_batch[batch_index, :, : sample_mel.shape[2]] = sample_mel[0]
         speech_batch, _ = self.model.hift.inference(speech_feat=mel_batch)
         sample_per_frame = self._infer_sample_per_mel_frame()
+        speech_batch_cpu = speech_batch.cpu()
 
         output_speeches: List[torch.Tensor] = []
         for batch_index, mel_length in enumerate(generated_mel_len):
             expected_speech_len = int(mel_length * sample_per_frame)
-            expected_speech_len = min(expected_speech_len, speech_batch.shape[1])
+            expected_speech_len = min(expected_speech_len, speech_batch_cpu.shape[1])
             output_speeches.append(
-                speech_batch[batch_index : batch_index + 1, :expected_speech_len].cpu()
+                speech_batch_cpu[batch_index : batch_index + 1, :expected_speech_len]
             )
         return output_speeches
 
@@ -431,15 +432,18 @@ class StagedBatchInferenceRunner:
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if getattr(decoder, "t_scheduler", "") == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+
+        # Classifier-free guidance inputs are invariant across diffusion steps.
+        mask_in = torch.cat([mask, mask], dim=0)
+        mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0)
+        spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
+        cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
+
         x = z
         t = t_span[0].unsqueeze(0)
         dt = t_span[1] - t_span[0]
         for step in range(1, len(t_span)):
             x_in = torch.cat([x, x], dim=0)
-            mask_in = torch.cat([mask, mask], dim=0)
-            mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-            spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
-            cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
             t_in = t.repeat(2 * batch_size).to(spks.dtype)
 
             dphi_dt = decoder.forward_estimator(
