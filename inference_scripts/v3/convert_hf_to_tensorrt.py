@@ -22,6 +22,7 @@ def debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> No
         "data": data,
         "timestamp": int(time.time() * 1000),
     }
+    Path(DEBUG_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as log_file:
         log_file.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
