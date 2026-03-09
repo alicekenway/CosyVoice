@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 import argparse
+import json
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+DEBUG_LOG_PATH = "/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-b1613d.log"
+DEBUG_SESSION_ID = "b1613d"
+
+
+def debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 def repo_root() -> Path:
@@ -17,7 +37,34 @@ def repo_root() -> Path:
 def run_command(command: list[str]) -> None:
     rendered = " ".join(str(token) for token in command)
     print(f"[run] {rendered}")
-    subprocess.run(command, check=True)
+    # #region agent log
+    debug_log(
+        "H1",
+        "inference_scripts/v3/convert_hf_to_tensorrt.py:run_command",
+        "About to run subprocess",
+        {
+            "command_head": command[:4],
+            "python_executable": sys.executable,
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+            "path_head": os.environ.get("PATH", "").split(":")[:4],
+        },
+    )
+    # #endregion
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as error:
+        # #region agent log
+        debug_log(
+            "H4",
+            "inference_scripts/v3/convert_hf_to_tensorrt.py:run_command",
+            "Subprocess command failed",
+            {
+                "returncode": error.returncode,
+                "failed_command_head": error.cmd[:4] if isinstance(error.cmd, list) else str(error.cmd),
+            },
+        )
+        # #endregion
+        raise
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +114,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # #region agent log
+    debug_log(
+        "H2",
+        "inference_scripts/v3/convert_hf_to_tensorrt.py:main",
+        "Parent process runtime environment",
+        {
+            "python_executable": sys.executable,
+            "python_version": sys.version.split()[0],
+            "sys_prefix": sys.prefix,
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+            "libpython_in_prefix": str(Path(sys.prefix) / "lib" / "libpython3.10.so.1.0"),
+            "libpython_exists_in_prefix": (Path(sys.prefix) / "lib" / "libpython3.10.so.1.0").exists(),
+        },
+    )
+    # #endregion
     if args.tp_size <= 0 or args.pp_size <= 0 or args.cp_size <= 0:
         raise ValueError("--tp_size/--pp_size/--cp_size must be positive")
     if args.workers <= 0 or args.max_batch_size <= 0 or args.max_num_tokens <= 0:

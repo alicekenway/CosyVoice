@@ -1,8 +1,45 @@
 import argparse
+import json
 import os
+import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+DEBUG_LOG_PATH = "/home/jinyang_wang/Dev/TTS/TTS_cosyvoice/.cursor/debug-b1613d.log"
+DEBUG_SESSION_ID = "b1613d"
+
+
+def debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+# #region agent log
+debug_log(
+    "H3",
+    "runtime/triton_trtllm/scripts/convert_checkpoint.py:module",
+    "Child process pre-import environment",
+    {
+        "python_executable": sys.executable,
+        "python_version": sys.version.split()[0],
+        "sys_prefix": sys.prefix,
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "libpython_in_prefix": str(Path(sys.prefix) / "lib" / "libpython3.10.so.1.0"),
+        "libpython_exists_in_prefix": (Path(sys.prefix) / "lib" / "libpython3.10.so.1.0").exists(),
+    },
+)
+# #endregion
 
 from transformers import AutoConfig
 
