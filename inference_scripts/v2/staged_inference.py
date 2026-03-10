@@ -4,6 +4,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import warnings
 from torch.nn.utils.rnn import pad_sequence
 
 from batch_types import PreparedRow, SegmentInput, SynthesisResult
@@ -254,6 +255,14 @@ class StagedBatchInferenceRunner:
                 stop_token_set, device,
             )
         else:
+            warnings.warn(
+                "LLM backend does not support KV-cache decoding (missing "
+                "`forward_one_step`). Falling back to full-sequence decoding, "
+                "which can add significant latency. "
+                f"llm_module={llm_module.__class__.__name__}, "
+                f"llm_encoder={llm_module.llm.__class__.__name__}",
+                RuntimeWarning,
+            )
             generated_tokens = self._llm_decode_full_seq(
                 llm_module, prefix_sequences, prefix_lengths,
                 min_len, max_len, max_decode_steps, batch_size,
