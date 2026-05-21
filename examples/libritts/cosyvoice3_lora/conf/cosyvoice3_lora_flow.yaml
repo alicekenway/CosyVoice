@@ -1,0 +1,123 @@
+# CosyVoice3 Flow (DiT) LoRA fine-tuning config
+
+# random seed
+__set_seed1: !apply:random.seed [1986]
+__set_seed2: !apply:numpy.random.seed [1986]
+__set_seed3: !apply:torch.manual_seed [1986]
+__set_seed4: !apply:torch.cuda.manual_seed_all [1986]
+
+# fixed params
+sample_rate: 24000
+llm_input_size: 896
+llm_output_size: 896
+spk_embed_dim: 192
+qwen_pretrain_path: ''
+token_frame_rate: 25
+token_mel_ratio: 2
+
+# model params — only Flow is needed for Flow LoRA training
+flow: !new:cosyvoice.flow.flow.CausalMaskedDiffWithDiT
+    input_size: 80
+    output_size: 80
+    spk_embed_dim: !ref <spk_embed_dim>
+    output_type: 'mel'
+    vocab_size: 6561
+    input_frame_rate: !ref <token_frame_rate>
+    only_mask_loss: True
+    token_mel_ratio: !ref <token_mel_ratio>
+    pre_lookahead_len: 3
+    pre_lookahead_layer: !new:cosyvoice.transformer.upsample_encoder.PreLookaheadLayer
+        in_channels: 80
+        channels: 1024
+        pre_lookahead_len: 3
+    decoder: !new:cosyvoice.flow.flow_matching.CausalConditionalCFM
+        in_channels: 240
+        n_spks: 1
+        spk_emb_dim: 80
+        cfm_params: !new:omegaconf.DictConfig
+            content:
+                sigma_min: 1e-06
+                solver: 'euler'
+                t_scheduler: 'cosine'
+                training_cfg_rate: 0.2
+                inference_cfg_rate: 0.7
+                reg_loss_type: 'l1'
+        estimator: !new:cosyvoice.flow.DiT.dit.DiT
+            dim: 1024
+            depth: 22
+            heads: 16
+            dim_head: 64
+            ff_mult: 2
+            mel_dim: 80
+            mu_dim: 80
+            spk_dim: 80
+            out_channels: 80
+            static_chunk_size: 50
+            num_decoding_left_chunks: -1
+
+# LoRA config
+lora_conf:
+    target: flow
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    dit_target_attn: true
+    dit_target_ff: false
+
+# processor functions
+parquet_opener: !name:cosyvoice.dataset.processor.parquet_opener
+get_tokenizer: !name:cosyvoice.tokenizer.tokenizer.get_qwen_tokenizer
+    token_path: !ref <qwen_pretrain_path>
+    skip_special_tokens: True
+    version: cosyvoice3
+allowed_special: 'all'
+tokenize: !name:cosyvoice.dataset.processor.tokenize
+    get_tokenizer: !ref <get_tokenizer>
+    allowed_special: !ref <allowed_special>
+filter: !name:cosyvoice.dataset.processor.filter
+    max_length: 6000
+    min_length: 100
+    token_max_length: 200
+    token_min_length: 1
+resample: !name:cosyvoice.dataset.processor.resample
+    resample_rate: !ref <sample_rate>
+feat_extractor: !name:matcha.utils.audio.mel_spectrogram
+    n_fft: 1920
+    num_mels: 80
+    sampling_rate: !ref <sample_rate>
+    hop_size: 480
+    win_size: 1920
+    fmin: 0
+    fmax: null
+    center: False
+compute_fbank: !name:cosyvoice.dataset.processor.compute_fbank
+    feat_extractor: !ref <feat_extractor>
+    num_frames: 960
+compute_whisper_fbank: !name:cosyvoice.dataset.processor.compute_whisper_fbank
+    num_frames: 960
+parse_embedding: !name:cosyvoice.dataset.processor.parse_embedding
+    normalize: True
+shuffle: !name:cosyvoice.dataset.processor.shuffle
+    shuffle_size: 1000
+sort: !name:cosyvoice.dataset.processor.sort
+    sort_size: 500
+batch: !name:cosyvoice.dataset.processor.batch
+    batch_type: 'dynamic'
+    max_frames_in_batch: 2000
+padding: !name:cosyvoice.dataset.processor.padding
+    use_spk_embedding: False
+
+# training config for flow LoRA
+train_conf:
+    optim: adamw
+    optim_conf:
+        lr: 1e-4
+        weight_decay: 0.01
+    scheduler: constantlr
+    scheduler_conf:
+        warmup_steps: 0
+    max_epoch: 100
+    grad_clip: 1.0
+    accum_grad: 2
+    log_interval: 50
+    save_per_step: 1000

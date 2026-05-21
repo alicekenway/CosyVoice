@@ -53,6 +53,13 @@ Hello, this is a test.	/home/jinyang_wang/audio/prompt.wav
 
 The text column must be named `text`.
 
+An optional `id` column is also supported:
+
+```tsv
+text	reference_audio_path	id
+Hello, this is a test.	/home/jinyang_wang/audio/prompt.wav	sample-001
+```
+
 The reference audio column can use any of these names:
 
 ```text
@@ -99,11 +106,20 @@ speechpath	text
 wav/utt_000000.wav	<|en|>Hello, this is a test.
 ```
 
+If the input TSV has an `id` column, `generated.tsv` also includes it:
+
+```tsv
+speechpath	text	id
+wav/utt_000000.wav	<|en|>Hello, this is a test.	sample-001
+```
+
 `failed.tsv` has:
 
 ```tsv
 row_id	text	ref_audio	error
 ```
+
+If the input TSV has an `id` column, `failed.tsv` includes it after `row_id`.
 
 `row_id` is the input TSV data row number, starting at `1` after the header.
 
@@ -165,4 +181,3 @@ WAV directory: ...
 Metadata TSV: ...
 Failure TSV: ...
 ```
-

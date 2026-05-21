@@ -132,7 +132,22 @@ def save_result(
     abs_speech_path = wav_dir / file_name
     rel_speech_path = f"wav/{file_name}"
     torchaudio.save(str(abs_speech_path), result.speech, sample_rate)
-    return {"speechpath": rel_speech_path, "text": result.text_for_metadata}
+    metadata_row = {"speechpath": rel_speech_path, "text": result.text_for_metadata}
+    if result.row.input_id is not None:
+        metadata_row["id"] = result.row.input_id
+    return metadata_row
+
+
+def build_failure_row(row: TsvInputRow, error_message: str) -> Dict[str, str]:
+    failure_row = {
+        "row_id": row.row_id,
+        "text": row.text,
+        "ref_audio": row.ref_audio_path,
+        "error": error_message,
+    }
+    if row.input_id is not None:
+        failure_row["id"] = row.input_id
+    return failure_row
 
 
 def prepare_batch_rows(
@@ -148,14 +163,7 @@ def prepare_batch_rows(
         except Exception as exc:  # pylint: disable=broad-except
             if on_error == "raise":
                 raise RuntimeError(f"Frontend preparation failed for row_id={row.row_id}: {exc}") from exc
-            failure_rows.append(
-                {
-                    "row_id": row.row_id,
-                    "text": row.text,
-                    "ref_audio": row.ref_audio_path,
-                    "error": f"Frontend preparation failed: {exc}",
-                }
-            )
+            failure_rows.append(build_failure_row(row, f"Frontend preparation failed: {exc}"))
             continue
         prepared_rows.append(prepared_row)
     return prepared_rows, failure_rows
@@ -214,6 +222,7 @@ def main() -> None:
     rows = load_rows(input_tsv_path)
     if not rows:
         raise ValueError(f"No valid rows found in input TSV: {input_tsv_path}")
+    include_input_id = any(row.input_id is not None for row in rows)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     wav_dir.mkdir(parents=True, exist_ok=True)
@@ -284,12 +293,7 @@ def main() -> None:
                             f"Inference failed for row_id={result.row.row_id}: {result.error_message}"
                         )
                     failure_rows.append(
-                        {
-                            "row_id": result.row.row_id,
-                            "text": result.row.text,
-                            "ref_audio": result.row.ref_audio_path,
-                            "error": result.error_message or "Unknown error",
-                        }
+                        build_failure_row(result.row, result.error_message or "Unknown error")
                     )
 
             batch_runtime_sec = time.perf_counter() - batch_start_time
@@ -316,8 +320,8 @@ def main() -> None:
     save_wait_sec = time.perf_counter() - save_wait_start_time
     total_runtime_sec += save_wait_sec
 
-    write_metadata(output_tsv_path, metadata_rows)
-    write_failures(failed_tsv_path, failure_rows)
+    write_metadata(output_tsv_path, metadata_rows, include_input_id=include_input_id)
+    write_failures(failed_tsv_path, failure_rows, include_input_id=include_input_id)
 
     overall_rtf = safe_rtf(total_runtime_sec, total_audio_sec)
     overall_avg_time_sec = total_runtime_sec / len(metadata_rows) if metadata_rows else 0.0

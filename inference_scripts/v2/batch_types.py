@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -10,6 +10,7 @@ class TsvInputRow:
     row_id: str
     text: str
     ref_audio_path: str
+    input_id: Optional[str] = None
 
 
 @dataclass

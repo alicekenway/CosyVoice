@@ -23,6 +23,8 @@ def resolve_columns(fieldnames: Sequence[str]) -> Dict[str, str]:
     column_mapping: Dict[str, str] = {}
     for column_name in fieldnames:
         normalized_name = normalize_header(column_name)
+        if normalized_name == "id":
+            column_mapping["id"] = column_name
         if normalized_name == "text":
             column_mapping["text"] = column_name
         if normalized_name in {
@@ -60,12 +62,16 @@ def load_rows(input_tsv_path: Path) -> List[TsvInputRow]:
             ref_audio_path = (row.get(column_mapping["ref_audio"], "") or "").strip()
             if not text or not ref_audio_path:
                 continue
+            input_id = None
+            if "id" in column_mapping:
+                input_id = (row.get(column_mapping["id"], "") or "").strip()
             rows.append(
                 TsvInputRow(
                     output_index=output_index,
                     row_id=str(row_index),
                     text=text,
                     ref_audio_path=ref_audio_path,
+                    input_id=input_id,
                 )
             )
             output_index += 1
@@ -79,22 +85,37 @@ def chunked(items: Sequence[_T], chunk_size: int) -> Iterator[Sequence[_T]]:
         yield items[start_index : start_index + chunk_size]
 
 
-def write_metadata(output_tsv_path: Path, metadata_rows: Iterable[Dict[str, str]]) -> None:
+def write_metadata(
+    output_tsv_path: Path,
+    metadata_rows: Iterable[Dict[str, str]],
+    include_input_id: bool = False,
+) -> None:
+    fieldnames = ["speechpath", "text"]
+    if include_input_id:
+        fieldnames.append("id")
     with output_tsv_path.open("w", encoding="utf-8", newline="") as metadata_file:
         writer = csv.DictWriter(
             metadata_file,
-            fieldnames=["speechpath", "text"],
+            fieldnames=fieldnames,
             delimiter="\t",
         )
         writer.writeheader()
         writer.writerows(metadata_rows)
 
 
-def write_failures(failure_tsv_path: Path, failure_rows: Iterable[Dict[str, str]]) -> None:
+def write_failures(
+    failure_tsv_path: Path,
+    failure_rows: Iterable[Dict[str, str]],
+    include_input_id: bool = False,
+) -> None:
+    fieldnames = ["row_id"]
+    if include_input_id:
+        fieldnames.append("id")
+    fieldnames.extend(["text", "ref_audio", "error"])
     with failure_tsv_path.open("w", encoding="utf-8", newline="") as failure_file:
         writer = csv.DictWriter(
             failure_file,
-            fieldnames=["row_id", "text", "ref_audio", "error"],
+            fieldnames=fieldnames,
             delimiter="\t",
         )
         writer.writeheader()
