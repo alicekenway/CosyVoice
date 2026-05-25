@@ -137,13 +137,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--launcher",
-        choices=["sbatch", "srun", "local"],
+        choices=["sbatch", "local"],
         default="sbatch",
         help=(
             "How to launch each chunk. sbatch submits independent GPU jobs "
-            "(recommended when the master runs in a CPU-only allocation); srun "
-            "creates job steps inside the current allocation; local runs the "
-            "chunk scripts directly."
+            "(recommended when the master runs in a CPU-only allocation); "
+            "local runs the chunk scripts directly."
         ),
     )
     parser.add_argument(
@@ -153,15 +152,6 @@ def parse_args() -> argparse.Namespace:
             "sbatch command prefix for each chunk, quoted as one string. "
             "The wrapper adds per-chunk --output/--error paths and the chunk "
             "script path. --wait is added automatically if omitted."
-        ),
-    )
-    parser.add_argument(
-        "--srun_cmd",
-        default="srun --gres=gpu:1 --ntasks=1",
-        help=(
-            "srun command prefix for each chunk when --launcher srun is used, "
-            "quoted as one string. This creates job steps in the current "
-            "allocation and is not recommended for a CPU-only master job."
         ),
     )
     parser.add_argument(
@@ -432,8 +422,6 @@ def launch_command_for_job(args: argparse.Namespace, job: ChunkJob) -> List[str]
             str(job.stderr_path),
             str(job.run_script_path),
         ]
-    if args.launcher == "srun":
-        return [*split_command(args.srun_cmd), str(job.run_script_path)]
     return [str(job.run_script_path)]
 
 

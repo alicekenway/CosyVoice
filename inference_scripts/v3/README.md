@@ -200,9 +200,8 @@ Launcher-only options for `cosyvoice_generate_from_tsv_srun.py`:
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `--num_gpus` | yes | none | Number of TSV chunks and subprocesses to launch. |
-| `--launcher` | no | `sbatch` | Use `sbatch` for independent GPU jobs, `srun` for job steps inside the current allocation, or `local` for direct local subprocesses. |
+| `--launcher` | no | `sbatch` | Use `sbatch` for independent GPU jobs, or `local` for direct local subprocesses. |
 | `--sbatch_cmd` | no | `sbatch --wait --gres=gpu:1 --ntasks=1` | Command prefix used for each independent GPU chunk job. Quote the full command as one argument. |
-| `--srun_cmd` | no | `srun --gres=gpu:1 --ntasks=1` | Command prefix used only when `--launcher srun` is selected. |
 | `--conda_sh` | no | none | Writes `source <path>` into every chunk script before inference. |
 | `--conda_env` | no | none | Writes `conda activate <env>` into every chunk script before inference. |
 | `--setup_cmd` | no | none | Extra shell setup line. Can be repeated and is inserted before the child inference command. |
@@ -270,11 +269,6 @@ python3 cosyvoice_generate_from_tsv_srun.py \
   --setup_cmd 'source /mnt/users/jinyang_wang/miniforge3/etc/profile.d/conda.sh' \
   --setup_cmd 'conda activate cosy'
 ```
-
-The older step-based behavior is still available with `--launcher srun`, but it
-creates Slurm job steps inside the current allocation. If the master job only
-has CPU resources, or if `--exclusive` steps occupy the node, that mode can
-block with `Requested nodes are busy`.
 
 Adjust `--batch_size`, `--llm_batch_size`, and `--flow_batch_size` downward if GPU
 memory is limited. Increase them if there is enough GPU memory and you want better
