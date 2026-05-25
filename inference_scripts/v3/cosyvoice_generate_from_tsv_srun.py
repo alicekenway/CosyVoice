@@ -31,6 +31,8 @@ class ChunkJob:
     run_script_path: Path
     stdout_path: Path
     stderr_path: Path
+    submit_stdout_path: Path
+    submit_stderr_path: Path
     launch_command_path: Path
     process: subprocess.Popen | None = None
     returncode: int | None = None
@@ -39,8 +41,8 @@ class ChunkJob:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Split a CosyVoice TSV inference job across multiple Slurm srun "
-            "subprocesses, then merge the chunk outputs."
+            "Split a CosyVoice TSV inference job across multiple Slurm chunk "
+            "jobs, then merge the chunk outputs."
         )
     )
 
@@ -134,12 +136,32 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPU chunks/subprocesses to launch",
     )
     parser.add_argument(
-        "--srun_cmd",
-        default="srun",
+        "--launcher",
+        choices=["sbatch", "srun", "local"],
+        default="sbatch",
         help=(
-            "srun command prefix for each chunk, quoted as one string. Example: "
-            "'srun --gres=gpu:1 --ntasks=1 --cpus-per-task=8 --exclusive'. "
-            "Use an empty string to run chunks locally without srun."
+            "How to launch each chunk. sbatch submits independent GPU jobs "
+            "(recommended when the master runs in a CPU-only allocation); srun "
+            "creates job steps inside the current allocation; local runs the "
+            "chunk scripts directly."
+        ),
+    )
+    parser.add_argument(
+        "--sbatch_cmd",
+        default="sbatch --wait --gres=gpu:1 --ntasks=1",
+        help=(
+            "sbatch command prefix for each chunk, quoted as one string. "
+            "The wrapper adds per-chunk --output/--error paths and the chunk "
+            "script path. --wait is added automatically if omitted."
+        ),
+    )
+    parser.add_argument(
+        "--srun_cmd",
+        default="srun --gres=gpu:1 --ntasks=1",
+        help=(
+            "srun command prefix for each chunk when --launcher srun is used, "
+            "quoted as one string. This creates job steps in the current "
+            "allocation and is not recommended for a CPU-only master job."
         ),
     )
     parser.add_argument(
@@ -181,7 +203,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry_run",
         action="store_true",
-        help="Create chunk inputs/scripts and print launch commands without running srun",
+        help="Create chunk inputs/scripts and print launch commands without running jobs",
     )
     return parser.parse_args()
 
@@ -354,6 +376,8 @@ def build_jobs(
         run_script_path = chunk_dir / "run_chunk.sh"
         stdout_path = chunk_dir / "stdout.log"
         stderr_path = chunk_dir / "stderr.log"
+        submit_stdout_path = chunk_dir / "submit_stdout.log"
+        submit_stderr_path = chunk_dir / "submit_stderr.log"
         launch_command_path = chunk_dir / "launch_command.txt"
 
         write_chunk_tsv(input_tsv_path, fieldnames, rows)
@@ -368,24 +392,62 @@ def build_jobs(
                 run_script_path=run_script_path,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
+                submit_stdout_path=submit_stdout_path,
+                submit_stderr_path=submit_stderr_path,
                 launch_command_path=launch_command_path,
             )
         )
     return jobs
 
 
-def srun_prefix(srun_cmd: str) -> List[str]:
-    if not srun_cmd.strip():
+def split_command(command: str) -> List[str]:
+    if not command.strip():
         return []
-    return shlex.split(srun_cmd)
+    return shlex.split(command)
+
+
+def has_long_option(tokens: Sequence[str], option_name: str) -> bool:
+    return any(token == option_name or token.startswith(f"{option_name}=") for token in tokens)
+
+
+def sbatch_prefix(sbatch_cmd: str) -> List[str]:
+    prefix = split_command(sbatch_cmd)
+    if not prefix:
+        raise ValueError("--sbatch_cmd must not be empty when --launcher sbatch is used")
+    if not has_long_option(prefix, "--wait"):
+        prefix.append("--wait")
+    return prefix
+
+
+def launch_command_for_job(args: argparse.Namespace, job: ChunkJob) -> List[str]:
+    if args.launcher == "sbatch":
+        prefix = sbatch_prefix(args.sbatch_cmd)
+        if not has_long_option(prefix, "--job-name"):
+            prefix.extend(["--job-name", f"cosyvoice_chunk_{job.index:04d}"])
+        return [
+            *prefix,
+            "--output",
+            str(job.stdout_path),
+            "--error",
+            str(job.stderr_path),
+            str(job.run_script_path),
+        ]
+    if args.launcher == "srun":
+        return [*split_command(args.srun_cmd), str(job.run_script_path)]
+    return [str(job.run_script_path)]
+
+
+def launch_log_paths(job: ChunkJob, launcher: str) -> tuple[Path, Path]:
+    if launcher == "sbatch":
+        return job.submit_stdout_path, job.submit_stderr_path
+    return job.stdout_path, job.stderr_path
 
 
 def launch_jobs(args: argparse.Namespace, jobs: Sequence[ChunkJob]) -> None:
-    prefix = srun_prefix(args.srun_cmd)
     launched_jobs: List[ChunkJob] = []
     try:
         for job in jobs:
-            launch_command = [*prefix, str(job.run_script_path)]
+            launch_command = launch_command_for_job(args, job)
             job.launch_command_path.write_text(
                 shlex.join(launch_command) + "\n",
                 encoding="utf-8",
@@ -393,7 +455,8 @@ def launch_jobs(args: argparse.Namespace, jobs: Sequence[ChunkJob]) -> None:
             print(f"[launch chunk {job.index}] {shlex.join(launch_command)}")
             if args.dry_run:
                 continue
-            with job.stdout_path.open("w", encoding="utf-8") as stdout_file, job.stderr_path.open(
+            stdout_path, stderr_path = launch_log_paths(job, args.launcher)
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
                 "w", encoding="utf-8"
             ) as stderr_file:
                 job.process = subprocess.Popen(
@@ -443,7 +506,8 @@ def ensure_all_jobs_succeeded(jobs: Sequence[ChunkJob]) -> None:
     if not failed_jobs:
         return
     details = ", ".join(
-        f"chunk_{job.index:04d} rc={job.returncode} stderr={job.stderr_path}"
+        f"chunk_{job.index:04d} rc={job.returncode} "
+        f"stderr={job.stderr_path} submit_stderr={job.submit_stderr_path}"
         for job in failed_jobs
     )
     raise RuntimeError(f"One or more chunk jobs failed; not merging outputs: {details}")
