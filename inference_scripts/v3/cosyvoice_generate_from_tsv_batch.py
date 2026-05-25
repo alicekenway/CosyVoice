@@ -14,7 +14,15 @@ if str(CURRENT_DIR) not in sys.path:
 
 from batch_types import PreparedRow, SynthesisResult, TsvInputRow
 from frontend_batch import CrossLingualBatchPreparer
-from io_utils import LANG_TOKEN_MAP, chunked, load_rows, write_failures, write_metadata
+from io_utils import (
+    LANG_TOKEN_MAP,
+    append_failures,
+    append_metadata,
+    chunked,
+    load_rows,
+    write_failures,
+    write_metadata,
+)
 from staged_inference import StagedBatchInferenceRunner
 
 def repo_root() -> Path:
@@ -248,9 +256,12 @@ def main() -> None:
         flow_n_timesteps=args.flow_n_timesteps,
     )
 
-    metadata_rows: List[Dict[str, str]] = []
-    save_futures: List[Tuple[int, Future[Dict[str, str]]]] = []
-    failure_rows: List[Dict[str, str]] = []
+    # Create output TSVs up front so long-running jobs expose progress.
+    write_metadata(output_tsv_path, [], include_input_id=include_input_id)
+    write_failures(failed_tsv_path, [], include_input_id=include_input_id)
+
+    generated_count = 0
+    failed_count = 0
     total_runtime_sec = 0.0
     save_wait_sec = 0.0
     total_audio_sec = 0.0
@@ -265,8 +276,15 @@ def main() -> None:
                 preparer=preparer,
                 on_error=args.on_error,
             )
-            failure_rows.extend(frontend_failures)
+            batch_failure_rows: List[Dict[str, str]] = list(frontend_failures)
+            batch_save_futures: List[Tuple[int, Future[Dict[str, str]]]] = []
             if not prepared_rows:
+                append_failures(
+                    failed_tsv_path,
+                    batch_failure_rows,
+                    include_input_id=include_input_id,
+                )
+                failed_count += len(batch_failure_rows)
                 continue
 
             batch_success_count = 0
@@ -274,7 +292,7 @@ def main() -> None:
             for result in runner.run_batch(prepared_rows):
                 if result.is_success:
                     item_audio_sec = speech_duration_sec(result.speech, cosyvoice.sample_rate)
-                    save_futures.append(
+                    batch_save_futures.append(
                         (
                             result.row.output_index,
                             save_executor.submit(
@@ -292,9 +310,29 @@ def main() -> None:
                         raise RuntimeError(
                             f"Inference failed for row_id={result.row.row_id}: {result.error_message}"
                         )
-                    failure_rows.append(
+                    batch_failure_rows.append(
                         build_failure_row(result.row, result.error_message or "Unknown error")
                     )
+
+            batch_save_wait_start_time = time.perf_counter()
+            batch_metadata_rows: List[Dict[str, str]] = []
+            for _, save_future in sorted(batch_save_futures, key=lambda item: item[0]):
+                batch_metadata_rows.append(save_future.result())
+            batch_save_wait_sec = time.perf_counter() - batch_save_wait_start_time
+            save_wait_sec += batch_save_wait_sec
+
+            append_metadata(
+                output_tsv_path,
+                batch_metadata_rows,
+                include_input_id=include_input_id,
+            )
+            append_failures(
+                failed_tsv_path,
+                batch_failure_rows,
+                include_input_id=include_input_id,
+            )
+            generated_count += len(batch_metadata_rows)
+            failed_count += len(batch_failure_rows)
 
             batch_runtime_sec = time.perf_counter() - batch_start_time
             if batch_success_count > 0:
@@ -306,7 +344,9 @@ def main() -> None:
                     f"[batch {batch_index}] size={len(row_batch)}, success={batch_success_count}, "
                     f"time_sec={batch_runtime_sec:.3f}, audio_sec={batch_audio_sec:.3f}, "
                     f"rtf={batch_rtf:.4f}, avg_time_sec={batch_avg_time_sec:.3f}, "
-                    f"avg_audio_sec={batch_avg_audio_sec:.3f}, avg_rtf={batch_avg_rtf:.4f}"
+                    f"avg_audio_sec={batch_avg_audio_sec:.3f}, avg_rtf={batch_avg_rtf:.4f}, "
+                    f"save_wait_sec={batch_save_wait_sec:.3f}, "
+                    f"metadata_rows_written={len(batch_metadata_rows)}"
                 )
                 total_runtime_sec += batch_runtime_sec
                 total_audio_sec += batch_audio_sec
@@ -314,18 +354,9 @@ def main() -> None:
     finally:
         save_executor.shutdown(wait=True)
 
-    save_wait_start_time = time.perf_counter()
-    for _, save_future in sorted(save_futures, key=lambda item: item[0]):
-        metadata_rows.append(save_future.result())
-    save_wait_sec = time.perf_counter() - save_wait_start_time
-    total_runtime_sec += save_wait_sec
-
-    write_metadata(output_tsv_path, metadata_rows, include_input_id=include_input_id)
-    write_failures(failed_tsv_path, failure_rows, include_input_id=include_input_id)
-
     overall_rtf = safe_rtf(total_runtime_sec, total_audio_sec)
-    overall_avg_time_sec = total_runtime_sec / len(metadata_rows) if metadata_rows else 0.0
-    overall_avg_audio_sec = total_audio_sec / len(metadata_rows) if metadata_rows else 0.0
+    overall_avg_time_sec = total_runtime_sec / generated_count if generated_count else 0.0
+    overall_avg_audio_sec = total_audio_sec / generated_count if generated_count else 0.0
     overall_avg_batch_time_sec = (
         total_runtime_sec / successful_batch_count if successful_batch_count else 0.0
     )
@@ -335,8 +366,8 @@ def main() -> None:
     overall_avg_batch_rtf = safe_rtf(overall_avg_batch_time_sec, overall_avg_batch_audio_sec)
 
     print(f"Input rows: {len(rows)}")
-    print(f"Generated utterances: {len(metadata_rows)}")
-    print(f"Failed rows: {len(failure_rows)}")
+    print(f"Generated utterances: {generated_count}")
+    print(f"Failed rows: {failed_count}")
     print(
         f"Overall timing: total_time_sec={total_runtime_sec:.3f}, "
         f"total_audio_sec={total_audio_sec:.3f}, overall_rtf={overall_rtf:.4f}, "

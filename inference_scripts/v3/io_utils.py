@@ -99,9 +99,7 @@ def write_metadata(
     metadata_rows: Iterable[Dict[str, str]],
     include_input_id: bool = False,
 ) -> None:
-    fieldnames = ["speechpath", "text"]
-    if include_input_id:
-        fieldnames.append("id")
+    fieldnames = metadata_fieldnames(include_input_id)
     with output_tsv_path.open("w", encoding="utf-8", newline="") as metadata_file:
         writer = csv.DictWriter(
             metadata_file,
@@ -112,15 +110,36 @@ def write_metadata(
         writer.writerows(metadata_rows)
 
 
+def metadata_fieldnames(include_input_id: bool = False) -> List[str]:
+    fieldnames = ["speechpath", "text"]
+    if include_input_id:
+        fieldnames.append("id")
+    return fieldnames
+
+
+def append_metadata(
+    output_tsv_path: Path,
+    metadata_rows: Iterable[Dict[str, str]],
+    include_input_id: bool = False,
+) -> None:
+    rows = list(metadata_rows)
+    if not rows:
+        return
+    with output_tsv_path.open("a", encoding="utf-8", newline="") as metadata_file:
+        writer = csv.DictWriter(
+            metadata_file,
+            fieldnames=metadata_fieldnames(include_input_id),
+            delimiter="\t",
+        )
+        writer.writerows(rows)
+
+
 def write_failures(
     failure_tsv_path: Path,
     failure_rows: Iterable[Dict[str, str]],
     include_input_id: bool = False,
 ) -> None:
-    fieldnames = ["row_id"]
-    if include_input_id:
-        fieldnames.append("id")
-    fieldnames.extend(["text", "ref_audio", "error"])
+    fieldnames = failure_fieldnames(include_input_id)
     with failure_tsv_path.open("w", encoding="utf-8", newline="") as failure_file:
         writer = csv.DictWriter(
             failure_file,
@@ -129,3 +148,28 @@ def write_failures(
         )
         writer.writeheader()
         writer.writerows(failure_rows)
+
+
+def failure_fieldnames(include_input_id: bool = False) -> List[str]:
+    fieldnames = ["row_id"]
+    if include_input_id:
+        fieldnames.append("id")
+    fieldnames.extend(["text", "ref_audio", "error"])
+    return fieldnames
+
+
+def append_failures(
+    failure_tsv_path: Path,
+    failure_rows: Iterable[Dict[str, str]],
+    include_input_id: bool = False,
+) -> None:
+    rows = list(failure_rows)
+    if not rows:
+        return
+    with failure_tsv_path.open("a", encoding="utf-8", newline="") as failure_file:
+        writer = csv.DictWriter(
+            failure_file,
+            fieldnames=failure_fieldnames(include_input_id),
+            delimiter="\t",
+        )
+        writer.writerows(rows)

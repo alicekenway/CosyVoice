@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Callable, Dict, Iterable, List, Sequence
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -464,7 +464,11 @@ def launch_jobs(args: argparse.Namespace, jobs: Sequence[ChunkJob]) -> None:
         raise
 
 
-def wait_for_jobs(jobs: Sequence[ChunkJob], poll_interval_sec: float) -> None:
+def wait_for_jobs(
+    jobs: Sequence[ChunkJob],
+    poll_interval_sec: float,
+    poll_callback: Callable[[], None] | None = None,
+) -> None:
     active_jobs = [job for job in jobs if job.process is not None]
     try:
         while active_jobs:
@@ -477,6 +481,8 @@ def wait_for_jobs(jobs: Sequence[ChunkJob], poll_interval_sec: float) -> None:
                 active_jobs.remove(job)
                 status = "ok" if returncode == 0 else f"failed rc={returncode}"
                 print(f"[finish chunk {job.index}] {status}; logs={job.chunk_dir}")
+            if poll_callback is not None:
+                poll_callback()
             if active_jobs:
                 time.sleep(poll_interval_sec)
     except KeyboardInterrupt:
@@ -523,7 +529,14 @@ def read_tsv_rows(tsv_path: Path) -> List[Dict[str, str]]:
         reader = csv.DictReader(tsv_file, delimiter="\t")
         if not reader.fieldnames:
             return []
-        return [dict(row) for row in reader]
+        rows: List[Dict[str, str]] = []
+        for row in reader:
+            # A launcher can read while a chunk process is appending. Skip any
+            # partial trailing record rather than surfacing it in the merged TSV.
+            if None in row:
+                continue
+            rows.append(dict(row))
+        return rows
 
 
 def prefixed_speechpath(output_dir: Path, chunk_dir: Path, speechpath: str) -> str:
@@ -600,7 +613,19 @@ def main() -> None:
         print("Dry run complete; no chunk jobs were launched and no merged TSV was written.")
         return
 
-    wait_for_jobs(jobs, args.poll_interval_sec)
+    include_input_id = has_input_id(fieldnames)
+
+    def refresh_merged_outputs() -> None:
+        merge_outputs(
+            jobs=jobs,
+            output_dir=output_dir,
+            output_tsv_name=args.output_tsv_name,
+            failed_tsv_name=args.failed_tsv_name,
+            include_input_id=include_input_id,
+        )
+
+    refresh_merged_outputs()
+    wait_for_jobs(jobs, args.poll_interval_sec, poll_callback=refresh_merged_outputs)
     ensure_all_jobs_succeeded(jobs)
     ensure_chunk_outputs_exist(jobs, args.output_tsv_name, args.failed_tsv_name)
     generated_count, failure_count = merge_outputs(
@@ -608,7 +633,7 @@ def main() -> None:
         output_dir=output_dir,
         output_tsv_name=args.output_tsv_name,
         failed_tsv_name=args.failed_tsv_name,
-        include_input_id=has_input_id(fieldnames),
+        include_input_id=include_input_id,
     )
 
     print(f"Merged generated utterances: {generated_count}")

@@ -120,8 +120,9 @@ the script creates:
 ```
 
 For the Slurm launcher, the top-level `generated.tsv` and `failed.tsv` are
-merged files. Chunk-local inputs, logs, generated TSVs, failure TSVs, and WAVs
-are stored under `chunks/`:
+merged files. They are refreshed while chunk jobs are running, so completed
+batch rows become visible before the whole job finishes. Chunk-local inputs,
+logs, generated TSVs, failure TSVs, and WAVs are stored under `chunks/`:
 
 ```text
 /path/to/output_dir/
@@ -157,6 +158,9 @@ chunks/chunk_0000/wav/utt_000000.wav	<|en|>Hello, this is a test.
 speechpath	text
 wav/utt_000000.wav	<|en|>Hello, this is a test.
 ```
+
+The batch script creates `generated.tsv` at startup and appends rows after each
+completed input batch, after the corresponding WAV files have been saved.
 
 If the input TSV has an `id` column, `generated.tsv` also includes it:
 
