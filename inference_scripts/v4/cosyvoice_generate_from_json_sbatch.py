@@ -17,6 +17,7 @@ if str(CURRENT_DIR) not in sys.path:
 from io_utils import (  # pylint: disable=wrong-import-position
     LANG_TOKEN_MAP,
     ORIGINAL_ROW_ID_COLUMN,
+    count_tsv_rows,
     write_failures,
     write_metadata,
 )
@@ -50,6 +51,7 @@ class ExpandedCandidate:
 class ChunkJob:
     index: int
     chunk_dir: Path
+    candidate_count: int
     input_tsv_path: Path
     run_script_path: Path
     stdout_path: Path
@@ -227,6 +229,15 @@ def parse_args() -> argparse.Namespace:
         "--dry_run",
         action="store_true",
         help="Create expanded inputs/scripts and print launch commands without running jobs",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Ignore existing chunk output TSVs and regenerate from the first "
+            "candidate in each chunk. By default, existing generated/failed "
+            "TSV rows are treated as finished rows for resume."
+        ),
     )
     return parser.parse_args()
 
@@ -434,6 +445,8 @@ def child_command(args: argparse.Namespace, chunk_input_path: Path, chunk_dir: P
         command.append("--text_frontend")
     if args.lang:
         command.extend(["--lang", args.lang])
+    if args.overwrite:
+        command.append("--overwrite")
     return command
 
 
@@ -481,6 +494,7 @@ def build_jobs(
             ChunkJob(
                 index=chunk_index,
                 chunk_dir=chunk_dir,
+                candidate_count=len(candidates),
                 input_tsv_path=input_tsv_path,
                 run_script_path=run_script_path,
                 stdout_path=stdout_path,
@@ -491,6 +505,54 @@ def build_jobs(
             )
         )
     return jobs
+
+
+def completed_row_count_for_job(
+    job: ChunkJob,
+    output_tsv_name: str,
+    failed_tsv_name: str,
+) -> int:
+    return count_tsv_rows(job.chunk_dir / output_tsv_name) + count_tsv_rows(
+        job.chunk_dir / failed_tsv_name
+    )
+
+
+def jobs_needing_launch(
+    jobs: Sequence[ChunkJob],
+    output_tsv_name: str,
+    failed_tsv_name: str,
+    overwrite: bool,
+) -> List[ChunkJob]:
+    if overwrite:
+        return list(jobs)
+
+    pending_jobs: List[ChunkJob] = []
+    for job in jobs:
+        completed_count = completed_row_count_for_job(
+            job,
+            output_tsv_name,
+            failed_tsv_name,
+        )
+        if completed_count > job.candidate_count:
+            raise ValueError(
+                f"{job.chunk_dir} has {completed_count} finished rows, but "
+                f"this chunk only has {job.candidate_count} candidates. Use "
+                "--overwrite or a clean output directory if these files are stale."
+            )
+        if completed_count == job.candidate_count:
+            job.returncode = 0
+            print(
+                f"[resume chunk {job.index}] already complete "
+                f"({completed_count}/{job.candidate_count}); skipping launch"
+            )
+            continue
+        if completed_count:
+            print(
+                f"[resume chunk {job.index}] {completed_count}/"
+                f"{job.candidate_count} rows finished; launching for remainder"
+            )
+        pending_jobs.append(job)
+    return pending_jobs
 
 
 def split_command(command: str) -> List[str]:
@@ -808,7 +870,13 @@ def main() -> None:
     print(f"Chunk jobs: {len(jobs)}")
     print(f"Chunk root: {output_dir / args.chunk_dir_name}")
 
-    launch_jobs(args, jobs)
+    launchable_jobs = jobs_needing_launch(
+        jobs=jobs,
+        output_tsv_name=args.output_tsv_name,
+        failed_tsv_name=args.failed_tsv_name,
+        overwrite=args.overwrite,
+    )
+    launch_jobs(args, launchable_jobs)
     if args.dry_run:
         print("Dry run complete; no chunk jobs were launched and no grouped JSON was written.")
         return
@@ -831,7 +899,7 @@ def main() -> None:
         )
 
     refresh_outputs()
-    wait_for_jobs(jobs, args.poll_interval_sec, poll_callback=refresh_outputs)
+    wait_for_jobs(launchable_jobs, args.poll_interval_sec, poll_callback=refresh_outputs)
     ensure_all_jobs_succeeded(jobs)
     ensure_chunk_outputs_exist(jobs, args.output_tsv_name, args.failed_tsv_name)
     generated_count, failure_count = merge_outputs(

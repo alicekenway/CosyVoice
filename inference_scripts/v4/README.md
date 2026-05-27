@@ -137,6 +137,16 @@ also appends its own TSV rows after every completed batch.
 `expanded_manifest.json` records the exact mapping from internal candidate ids
 back to input record id, text index, and reference index.
 
+## Resume Behavior
+
+Rerunning the same command with the same `--output_dir` resumes automatically.
+Each chunk counts existing rows in its `generated.tsv` and `failed.tsv`, treats
+those rows as finished, and starts from the next input row. Chunks whose output
+rows already cover all candidates are skipped by the JSON launcher.
+
+Use `--overwrite` to ignore existing chunk outputs and regenerate from the
+first candidate.
+
 ## Important Options
 
 | Option | Required | Default | Description |
@@ -166,6 +176,7 @@ back to input record id, text index, and reference index.
 | `--setup_cmd` | no | none | Extra shell setup line. Can be repeated. |
 | `--python_cmd` | no | `python3` | Python command used after setup commands. |
 | `--chunk_dir_name` | no | `chunks` | Subdirectory under `output_dir` for per-chunk work directories. |
+| `--overwrite` | no | disabled | Ignore existing chunk output TSVs and regenerate from the first candidate. |
 | `--dry_run` | no | disabled | Create expanded inputs/scripts and print launch commands without running jobs. |
 
 ## Recommended Launch

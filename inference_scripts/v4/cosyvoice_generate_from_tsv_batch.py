@@ -6,8 +6,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import torchaudio
-
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
@@ -19,6 +17,7 @@ from io_utils import (
     append_failures,
     append_metadata,
     chunked,
+    count_tsv_rows,
     load_rows,
     write_failures,
     write_metadata,
@@ -128,6 +127,15 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of threads used to save wav files (default: 4)",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Replace existing output TSVs and start from the first input row. "
+            "By default, existing output/failure TSV rows are treated as "
+            "finished rows and inference resumes after them."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -136,6 +144,8 @@ def save_result(
     wav_dir: Path,
     sample_rate: int,
 ) -> Dict[str, str]:
+    import torchaudio  # pylint: disable=import-outside-toplevel
+
     file_name = f"utt_{result.row.output_index:06d}.wav"
     abs_speech_path = wav_dir / file_name
     rel_speech_path = f"wav/{file_name}"
@@ -191,6 +201,35 @@ def safe_rtf(runtime_sec: float, audio_sec: float) -> float:
     return runtime_sec / audio_sec
 
 
+def initialize_output_tsvs(
+    output_tsv_path: Path,
+    failed_tsv_path: Path,
+    include_input_id: bool,
+    row_count: int,
+    overwrite: bool,
+) -> Tuple[int, int, int]:
+    if overwrite:
+        write_metadata(output_tsv_path, [], include_input_id=include_input_id)
+        write_failures(failed_tsv_path, [], include_input_id=include_input_id)
+        return 0, 0, 0
+
+    if not output_tsv_path.exists() or output_tsv_path.stat().st_size == 0:
+        write_metadata(output_tsv_path, [], include_input_id=include_input_id)
+    if not failed_tsv_path.exists() or failed_tsv_path.stat().st_size == 0:
+        write_failures(failed_tsv_path, [], include_input_id=include_input_id)
+
+    generated_count = count_tsv_rows(output_tsv_path)
+    failed_count = count_tsv_rows(failed_tsv_path)
+    completed_count = generated_count + failed_count
+    if completed_count > row_count:
+        raise ValueError(
+            f"Existing output TSVs contain {completed_count} finished rows, "
+            f"but input TSV only has {row_count} valid rows. Use --overwrite "
+            "or a clean output directory if these files are stale."
+        )
+    return completed_count, generated_count, failed_count
+
+
 def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
@@ -208,19 +247,6 @@ def main() -> None:
     if args.save_workers <= 0:
         raise ValueError("--save_workers must be positive")
 
-    prepare_import_path()
-    from cosyvoice.cli.cosyvoice import AutoModel  # pylint: disable=import-outside-toplevel
-    import hyperpyyaml  # pylint: disable=import-outside-toplevel
-    import ruamel.yaml  # pylint: disable=import-outside-toplevel
-    if not hasattr(ruamel.yaml.Loader, "max_depth"):
-        ruamel.yaml.Loader.max_depth = None
-    if hasattr(ruamel.yaml, "SafeLoader") and not hasattr(ruamel.yaml.SafeLoader, "max_depth"):
-        ruamel.yaml.SafeLoader.max_depth = None
-    if hasattr(ruamel.yaml, "FullLoader") and not hasattr(ruamel.yaml.FullLoader, "max_depth"):
-        ruamel.yaml.FullLoader.max_depth = None
-    if hasattr(ruamel.yaml, "UnsafeLoader") and not hasattr(ruamel.yaml.UnsafeLoader, "max_depth"):
-        ruamel.yaml.UnsafeLoader.max_depth = None
-
     input_tsv_path = Path(args.input_tsv).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     wav_dir = output_dir / "wav"
@@ -234,6 +260,46 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     wav_dir.mkdir(parents=True, exist_ok=True)
+
+    completed_row_count, existing_generated_count, existing_failed_count = (
+        initialize_output_tsvs(
+            output_tsv_path=output_tsv_path,
+            failed_tsv_path=failed_tsv_path,
+            include_input_id=include_input_id,
+            row_count=len(rows),
+            overwrite=args.overwrite,
+        )
+    )
+    if completed_row_count:
+        resume_message = (
+            f"Resume detected: {completed_row_count}/{len(rows)} rows finished "
+            f"(generated={existing_generated_count}, failed={existing_failed_count})"
+        )
+        if completed_row_count < len(rows):
+            resume_message += f"; starting from input row {completed_row_count + 1}."
+        else:
+            resume_message += "."
+        print(resume_message)
+    if completed_row_count == len(rows):
+        print(f"All {len(rows)} input rows are already finished; nothing to do.")
+        print(f"WAV directory: {wav_dir}")
+        print(f"Metadata TSV: {output_tsv_path}")
+        print(f"Failure TSV: {failed_tsv_path}")
+        return
+    rows_to_process = rows[completed_row_count:]
+
+    prepare_import_path()
+    from cosyvoice.cli.cosyvoice import AutoModel  # pylint: disable=import-outside-toplevel
+    import hyperpyyaml  # pylint: disable=import-outside-toplevel,unused-import
+    import ruamel.yaml  # pylint: disable=import-outside-toplevel
+    if not hasattr(ruamel.yaml.Loader, "max_depth"):
+        ruamel.yaml.Loader.max_depth = None
+    if hasattr(ruamel.yaml, "SafeLoader") and not hasattr(ruamel.yaml.SafeLoader, "max_depth"):
+        ruamel.yaml.SafeLoader.max_depth = None
+    if hasattr(ruamel.yaml, "FullLoader") and not hasattr(ruamel.yaml.FullLoader, "max_depth"):
+        ruamel.yaml.FullLoader.max_depth = None
+    if hasattr(ruamel.yaml, "UnsafeLoader") and not hasattr(ruamel.yaml.UnsafeLoader, "max_depth"):
+        ruamel.yaml.UnsafeLoader.max_depth = None
 
     try:
         cosyvoice = AutoModel(model_dir=str(Path(args.model_path).expanduser().resolve()))
@@ -256,10 +322,6 @@ def main() -> None:
         flow_n_timesteps=args.flow_n_timesteps,
     )
 
-    # Create output TSVs up front so long-running jobs expose progress.
-    write_metadata(output_tsv_path, [], include_input_id=include_input_id)
-    write_failures(failed_tsv_path, [], include_input_id=include_input_id)
-
     generated_count = 0
     failed_count = 0
     total_runtime_sec = 0.0
@@ -269,7 +331,10 @@ def main() -> None:
     save_executor = ThreadPoolExecutor(max_workers=args.save_workers)
 
     try:
-        for batch_index, row_batch in enumerate(chunked(rows, args.batch_size), start=1):
+        for batch_index, row_batch in enumerate(
+            chunked(rows_to_process, args.batch_size),
+            start=1,
+        ):
             batch_start_time = time.perf_counter()
             prepared_rows, frontend_failures = prepare_batch_rows(
                 row_batch=row_batch,
@@ -366,8 +431,11 @@ def main() -> None:
     overall_avg_batch_rtf = safe_rtf(overall_avg_batch_time_sec, overall_avg_batch_audio_sec)
 
     print(f"Input rows: {len(rows)}")
-    print(f"Generated utterances: {generated_count}")
-    print(f"Failed rows: {failed_count}")
+    print(f"Existing completed rows skipped: {completed_row_count}")
+    print(f"Generated utterances this run: {generated_count}")
+    print(f"Failed rows this run: {failed_count}")
+    print(f"Generated utterances total: {existing_generated_count + generated_count}")
+    print(f"Failed rows total: {existing_failed_count + failed_count}")
     print(
         f"Overall timing: total_time_sec={total_runtime_sec:.3f}, "
         f"total_audio_sec={total_audio_sec:.3f}, overall_rtf={overall_rtf:.4f}, "
