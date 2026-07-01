@@ -22,6 +22,7 @@ omegaconf==2.3.0
 onnx==1.16.0
 onnxruntime-gpu==1.18.0; sys_platform == 'linux'
 onnxruntime==1.18.0; sys_platform == 'darwin' or sys_platform == 'win32'
+setuptools==81.0.0
 openai-whisper==20231117
 protobuf==4.25
 pyarrow==18.1.0
@@ -40,3 +41,9 @@ x-transformers==2.11.24
 uvicorn==0.30.0
 wetext==0.0.4
 wget==3.2
+
+# need to install openai-whisper independently, otherwise it has error
+# python -m pip install -U pip wheel setuptools==81.0.0
+
+# # IMPORTANT: avoid pip build isolation pulling setuptools 82.x in a temp env
+# python -m pip install --no-build-isolation openai-whisper==20231117
