@@ -94,6 +94,16 @@ def chunked(items: Sequence[_T], chunk_size: int) -> Iterator[Sequence[_T]]:
         yield items[start_index : start_index + chunk_size]
 
 
+def count_tsv_rows(tsv_path: Path) -> int:
+    if not tsv_path.exists() or tsv_path.stat().st_size == 0:
+        return 0
+    with tsv_path.open("r", encoding="utf-8", newline="") as tsv_file:
+        reader = csv.DictReader(tsv_file, delimiter="\t")
+        if not reader.fieldnames:
+            return 0
+        return sum(1 for row in reader if None not in row)
+
+
 def write_metadata(
     output_tsv_path: Path,
     metadata_rows: Iterable[Dict[str, str]],
