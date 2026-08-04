@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -155,6 +156,8 @@ def attach_reference_audio(
     records: List[JsonRecord],
     audio_paths: List[str],
     references_per_text: int,
+    no_shuffle: bool = False,
+    seed: int = 0,
 ) -> int:
     if references_per_text <= 0:
         raise ValueError("--references-per-text must be greater than 0")
@@ -167,10 +170,18 @@ def attach_reference_audio(
             f"{references_per_text}, but only found {len(audio_paths)}"
         )
 
+    if no_shuffle:
+        selected_audio_paths = audio_paths[:required_audio_count]
+    else:
+        selected_audio_paths = random.Random(seed).sample(
+            audio_paths,
+            required_audio_count,
+        )
+
     for record_index, record in enumerate(records):
         start = record_index * references_per_text
         end = start + references_per_text
-        record["reference_audio_path"] = audio_paths[start:end]
+        record["reference_audio_path"] = selected_audio_paths[start:end]
 
     return required_audio_count
 
@@ -237,8 +248,22 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help=(
             "Number of reference audios assigned to each prepared record, "
-            "taken sequentially from --audio-jsonl (default: 3)."
+            "without reusing an input row (default: 3)."
         ),
+    )
+    parser.add_argument(
+        "--no-shuffle",
+        action="store_true",
+        help=(
+            "Use audio rows sequentially in JSONL order instead of randomly "
+            "sampling without replacement."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed used by the default shuffled mode (default: 0).",
     )
     return parser.parse_args()
 
@@ -256,12 +281,22 @@ def main() -> None:
         records,
         audio_paths,
         args.references_per_text,
+        no_shuffle=args.no_shuffle,
+        seed=args.seed,
     )
     write_json(args.output_json.expanduser(), records)
 
     print(f"Records: {len(records)}")
     print(f"Text turns: {sum(len(record['text']) for record in records)}")
     print(f"References per record: {args.references_per_text}")
+    print(
+        "Reference audio selection: "
+        + (
+            "sequential JSONL order"
+            if args.no_shuffle
+            else f"random sample without replacement (seed={args.seed})"
+        )
+    )
     print(f"Reference audio paths used: {used_audio_count}")
     if len(audio_paths) > used_audio_count:
         print(f"Reference audio paths unused: {len(audio_paths) - used_audio_count}")
