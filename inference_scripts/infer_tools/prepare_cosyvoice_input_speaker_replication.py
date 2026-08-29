@@ -3,26 +3,42 @@ import argparse
 import json
 import random
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, List, Sequence, Tuple, Union
 
-"""
-Build CosyVoice v4 JSON input from target texts and an ASR JSONL dataset.
-Usually, we use it to generate a block of text with different speakers, for wuw.
+"""Build speaker-replicated CosyVoice 2/3 JSON input.
+
+Usually, this tool is used to generate a block of target texts with different
+speakers for wake-up-word synthesis. CosyVoice 2 uses reference audio only;
+CosyVoice 3 also requires an aligned transcript for every reference audio.
 
 Example:
 
-python3 prepare_cosyvoice_input_json.py \
+python3 prepare_cosyvoice_input_speaker_replication.py \
   --text-file /path/to/text.txt \
   --asr-jsonl /path/to/asr_dataset.jsonl \
+  --model-version cosy3 \
+  --audio-text-key text \
   --replication-index 300 \
   --candidate-number 3 \
-  --output-json /mnt/users/jinyang_wang/TTS_cosyvoice/generation/ENX/batch_2/input_tsv/control_expanded_test.json
+  --output-json /path/to/output.json
 """
 
 
 JsonRecord = Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AudioReference:
+    path: str
+    text: str = ""
+
+
+SpeakerReferenceMap = Dict[str, List[AudioReference]]
 SpeakerAudioMap = Dict[str, List[str]]
+ReferenceValue = Union[AudioReference, str]
+CompatibleSpeakerReferenceMap = Dict[str, List[ReferenceValue]]
 
 
 def positive_int(value: str) -> int:
@@ -51,12 +67,14 @@ def load_texts(text_path: Path) -> List[str]:
     return texts
 
 
-def load_speaker_audio(
+def load_speaker_references(
     jsonl_path: Path,
     speaker_key: str,
     audio_key: str,
-) -> Tuple[SpeakerAudioMap, int, int]:
-    audio_by_speaker: DefaultDict[str, List[str]] = defaultdict(list)
+    model_version: str = "cosy2",
+    audio_text_key: str = "text",
+) -> Tuple[SpeakerReferenceMap, int, int]:
+    references_by_speaker: DefaultDict[str, List[AudioReference]] = defaultdict(list)
     seen_by_speaker: DefaultDict[str, set[str]] = defaultdict(set)
     total_records = 0
     skipped_records = 0
@@ -78,35 +96,66 @@ def load_speaker_audio(
 
             speaker = str(record.get(speaker_key, "")).strip()
             audio_path = str(record.get(audio_key, "")).strip()
-            if not speaker or not audio_path:
+            reference_text = ""
+            if model_version == "cosy3":
+                reference_text = str(record.get(audio_text_key, "")).strip()
+            if not speaker or not audio_path or (
+                model_version == "cosy3" and not reference_text
+            ):
                 skipped_records += 1
                 continue
             if audio_path in seen_by_speaker[speaker]:
                 skipped_records += 1
                 continue
             seen_by_speaker[speaker].add(audio_path)
-            audio_by_speaker[speaker].append(audio_path)
+            references_by_speaker[speaker].append(
+                AudioReference(path=audio_path, text=reference_text)
+            )
 
-    if not audio_by_speaker:
+    if not references_by_speaker:
+        required_keys = f"'{speaker_key}' and '{audio_key}'"
+        if model_version == "cosy3":
+            required_keys += f" and '{audio_text_key}'"
         raise ValueError(
-            f"No usable '{speaker_key}' and '{audio_key}' pairs found in {jsonl_path}"
+            f"No usable {required_keys} records found in {jsonl_path}"
         )
-    return dict(audio_by_speaker), total_records, skipped_records
+    return dict(references_by_speaker), total_records, skipped_records
+
+
+def load_speaker_audio(
+    jsonl_path: Path,
+    speaker_key: str,
+    audio_key: str,
+) -> Tuple[SpeakerAudioMap, int, int]:
+    """Backward-compatible CosyVoice 2 loader."""
+    references_by_speaker, total_records, skipped_records = load_speaker_references(
+        jsonl_path=jsonl_path,
+        speaker_key=speaker_key,
+        audio_key=audio_key,
+        model_version="cosy2",
+    )
+    audio_by_speaker = {
+        speaker: [reference.path for reference in references]
+        for speaker, references in references_by_speaker.items()
+    }
+    return audio_by_speaker, total_records, skipped_records
 
 
 def eligible_speakers(
-    audio_by_speaker: SpeakerAudioMap,
+    audio_by_speaker: CompatibleSpeakerReferenceMap,
     candidate_number: int,
 ) -> List[str]:
     speakers = [
         speaker
-        for speaker, audio_paths in audio_by_speaker.items()
-        if len(audio_paths) >= candidate_number
+        for speaker, references in audio_by_speaker.items()
+        if len(references) >= candidate_number
     ]
     if not speakers:
-        max_refs = max(len(audio_paths) for audio_paths in audio_by_speaker.values())
+        max_refs = max(
+            len(references) for references in audio_by_speaker.values()
+        )
         raise ValueError(
-            f"No speaker has at least {candidate_number} unique audio paths. "
+            f"No speaker has at least {candidate_number} usable unique references. "
             f"The largest speaker has {max_refs}."
         )
     return speakers
@@ -125,29 +174,46 @@ def choose_speaker(
 
 def build_records(
     texts: Sequence[str],
-    audio_by_speaker: SpeakerAudioMap,
+    audio_by_speaker: CompatibleSpeakerReferenceMap,
     speakers: Sequence[str],
     replication_index: int,
     candidate_number: int,
     id_prefix: str,
     rng: random.Random,
     selection: str,
+    model_version: str = "cosy2",
 ) -> List[JsonRecord]:
     records: List[JsonRecord] = []
 
     for record_index in range(replication_index):
         speaker = choose_speaker(speakers, record_index, rng, selection)
-        reference_audio_paths = rng.sample(
+        references = rng.sample(
             audio_by_speaker[speaker],
             candidate_number,
         )
-        records.append(
-            {
-                "id": f"{id_prefix}_{record_index:06d}",
-                "text": list(texts),
-                "reference_audio_path": reference_audio_paths,
-            }
-        )
+        record: JsonRecord = {
+            "id": f"{id_prefix}_{record_index:06d}",
+            "text": list(texts),
+            "reference_audio_path": [
+                reference.path if isinstance(reference, AudioReference) else reference
+                for reference in references
+            ],
+        }
+        if model_version == "cosy3":
+            if any(
+                not isinstance(reference, AudioReference) or not reference.text
+                for reference in references
+            ):
+                raise ValueError(
+                    "CosyVoice 3 records require a non-empty transcript for every "
+                    "reference audio"
+                )
+            record["reference_audio_text"] = [
+                reference.text
+                for reference in references
+                if isinstance(reference, AudioReference)
+            ]
+        records.append(record)
 
     return records
 
@@ -162,9 +228,19 @@ def write_json(output_json: Path, records: Sequence[JsonRecord]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate CosyVoice v4 JSON input. Each output record contains the "
-            "whole target text file and N reference audios sampled from one speaker."
+            "Generate CosyVoice 2/3 JSON input. Each output record contains the "
+            "whole target text file and N references sampled from one speaker."
         )
+    )
+    parser.add_argument(
+        "--model-version",
+        "--model_version",
+        choices=("cosy2", "cosy3"),
+        default="cosy2",
+        help=(
+            "Output schema to generate. cosy2 preserves the audio-only schema; "
+            "cosy3 also writes aligned reference_audio_text (default: cosy2)."
+        ),
     )
     parser.add_argument(
         "--text-file",
@@ -183,14 +259,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "ASR JSONL dataset. Each line should contain speaker and "
-            "audio_filepath fields."
+            "audio_filepath fields; cosy3 also requires a transcript field."
         ),
     )
     parser.add_argument(
         "--output-json",
         required=True,
         type=Path,
-        help="Output CosyVoice v4 JSON path.",
+        help="Output CosyVoice JSON path.",
     )
     parser.add_argument(
         "--replication-index",
@@ -222,6 +298,15 @@ def parse_args() -> argparse.Namespace:
         "--audio-key",
         default="audio_filepath",
         help="JSONL key containing the audio path (default: audio_filepath).",
+    )
+    parser.add_argument(
+        "--audio-text-key",
+        "--reference-audio-text-key",
+        default="text",
+        help=(
+            "JSONL key containing the reference transcript for cosy3 "
+            "(default: text; ignored for cosy2)."
+        ),
     )
     parser.add_argument(
         "--id-prefix",
@@ -278,14 +363,16 @@ def main() -> None:
     output_json = args.output_json.expanduser()
 
     texts = load_texts(text_path)
-    audio_by_speaker, total_records, skipped_records = load_speaker_audio(
+    references_by_speaker, total_records, skipped_records = load_speaker_references(
         jsonl_path,
         args.speaker_key,
         args.audio_key,
+        args.model_version,
+        args.audio_text_key,
     )
 
     rng = random.Random(args.seed)
-    speakers = eligible_speakers(audio_by_speaker, args.candidate_number)
+    speakers = eligible_speakers(references_by_speaker, args.candidate_number)
     eligible_speaker_count = len(speakers)
     if args.no_shuffle_speakers:
         if args.start_from_speaker >= eligible_speaker_count:
@@ -299,13 +386,14 @@ def main() -> None:
 
     records = build_records(
         texts=texts,
-        audio_by_speaker=audio_by_speaker,
+        audio_by_speaker=references_by_speaker,
         speakers=speakers,
         replication_index=args.replication_index,
         candidate_number=args.candidate_number,
         id_prefix=args.id_prefix,
         rng=rng,
         selection=args.speaker_selection,
+        model_version=args.model_version,
     )
     write_json(output_json, records)
 
@@ -316,7 +404,8 @@ def main() -> None:
     print(f"Candidates per group: {args.candidate_number}")
     print(f"ASR JSONL records read: {total_records}")
     print(f"ASR JSONL records skipped: {skipped_records}")
-    print(f"Speakers found: {len(audio_by_speaker)}")
+    print(f"Model version: {args.model_version}")
+    print(f"Speakers found: {len(references_by_speaker)}")
     print(f"Eligible speakers found: {eligible_speaker_count}")
     print(f"Speaker shuffling enabled: {not args.no_shuffle_speakers}")
     print(f"Speakers skipped from start: {args.start_from_speaker}")
