@@ -39,7 +39,7 @@ class GeneratedCandidate:
     output_index: int
     candidate_index: int
     text: str
-    source_audio: Path
+    source_audio: Path | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,9 +202,9 @@ def output_index_in_range(
     )
 
 
-def resolve_audio_path(raw_audio: Any, audio_parent: Path, context: str) -> Path:
+def resolve_audio_path(raw_audio: Any, audio_parent: Path) -> Path | None:
     if raw_audio is None or str(raw_audio).strip() == "":
-        raise SystemExit(f"{context}: missing candidate audio path")
+        return None
     path = Path(str(raw_audio)).expanduser()
     if path.is_absolute():
         return path
@@ -246,16 +246,13 @@ def iter_generated_candidates(
                 )
 
             for candidate_index, raw_audio in enumerate(paths):
-                candidate_context = f"{context}, candidate #{candidate_index}"
                 yield GeneratedCandidate(
                     group_index=group_index,
                     group_id=group_id,
                     output_index=output_index,
                     candidate_index=candidate_index,
                     text=str(text),
-                    source_audio=resolve_audio_path(
-                        raw_audio, audio_parent, candidate_context
-                    ),
+                    source_audio=resolve_audio_path(raw_audio, audio_parent),
                 )
 
 
@@ -355,24 +352,35 @@ def main() -> int:
             candidates_seen += 1
             groups_seen.add(candidate.group_index)
             outputs_seen.add((candidate.group_index, candidate.output_index))
-            if not candidate.source_audio.is_file():
+            candidate_context = (
+                f"group #{candidate.group_index} (id={candidate.group_id!r}), "
+                f"output #{candidate.output_index}, "
+                f"candidate #{candidate.candidate_index}"
+            )
+            if candidate.source_audio is None:
                 if args.skip_missing:
                     print(
-                        "WARNING: skip missing audio: "
-                        f"{candidate.source_audio} "
-                        f"(group_id={candidate.group_id}, "
-                        f"output={candidate.output_index}, "
-                        f"candidate={candidate.candidate_index})",
+                        f"WARNING: {candidate_context}: "
+                        "skip missing candidate audio path",
                         file=sys.stderr,
                     )
                     missing_skipped += 1
                     continue
                 raise SystemExit(
-                    "source audio does not exist: "
-                    f"{candidate.source_audio} "
-                    f"(group_id={candidate.group_id}, "
-                    f"output={candidate.output_index}, "
-                    f"candidate={candidate.candidate_index})"
+                    f"{candidate_context}: missing candidate audio path"
+                )
+            if not candidate.source_audio.is_file():
+                if args.skip_missing:
+                    print(
+                        f"WARNING: {candidate_context}: skip missing audio file: "
+                        f"{candidate.source_audio}",
+                        file=sys.stderr,
+                    )
+                    missing_skipped += 1
+                    continue
+                raise SystemExit(
+                    f"{candidate_context}: source audio does not exist: "
+                    f"{candidate.source_audio}"
                 )
 
             wav_name = f"{next_audio_index:0{args.digits}d}.wav"

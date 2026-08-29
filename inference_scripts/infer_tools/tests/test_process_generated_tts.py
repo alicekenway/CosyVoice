@@ -3,6 +3,8 @@ import sys
 import tempfile
 import unittest
 import wave
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -111,6 +113,52 @@ class ProcessGeneratedTtsTests(unittest.TestCase):
             )
             with wave.open(str(output_dir / "wav" / "000000005.wav"), "rb") as wav_file:
                 self.assertEqual(wav_file.getframerate(), 16000)
+
+    def test_skip_missing_handles_empty_and_nonexistent_candidate_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            generated_path = root / "generated.json"
+            generated_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "group_15",
+                            "output": [
+                                {
+                                    "text": "Hello Loncin",
+                                    "candidate_audio_path": [
+                                        None,
+                                        "",
+                                        "not_generated.wav",
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            output_dir = root / "prepared"
+            argv = [
+                "process_generated_tts.py",
+                "--input",
+                str(generated_path),
+                "--output-dir",
+                str(output_dir),
+                "--skip-missing",
+            ]
+
+            stderr = StringIO()
+            with mock.patch.object(sys, "argv", argv), redirect_stderr(stderr):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(
+                (output_dir / "metadata.jsonl").read_text(encoding="utf-8"), ""
+            )
+            warnings = stderr.getvalue()
+            self.assertEqual(warnings.count("WARNING:"), 3)
+            self.assertIn("missing candidate audio path", warnings)
+            self.assertIn("not_generated.wav", warnings)
 
 
 if __name__ == "__main__":
