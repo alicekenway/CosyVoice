@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -23,6 +25,7 @@ from io_utils import (
     write_metadata,
 )
 from staged_inference import StagedBatchInferenceRunner
+from runtime_utils import COMPUTE_MODES, resolve_batch_sizes, resolve_cpu_threads
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant.<|endofprompt|>"
 MODEL_CONFIG_NAMES = {"cosy2": "cosyvoice2.yaml", "cosy3": "cosyvoice3.yaml"}
@@ -57,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         choices=["cosy2", "cosy3"],
         help="CosyVoice model family to use; validated against --model_path.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=COMPUTE_MODES,
+        default="gpu",
+        help="Expected compute device for this worker (default: gpu)",
     )
     parser.add_argument(
         "--input_tsv",
@@ -100,8 +109,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
-        help="Number of TSV rows processed together",
+        default=None,
+        help="Rows processed together (default: 4 on GPU, 1 on CPU)",
     )
     parser.add_argument(
         "--llm_batch_size",
@@ -238,6 +247,35 @@ def safe_rtf(runtime_sec: float, audio_sec: float) -> float:
     return runtime_sec / audio_sec
 
 
+def configure_compute_runtime(mode: str) -> int | None:
+    import torch  # pylint: disable=import-outside-toplevel
+
+    if mode == "gpu":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "GPU mode requested, but CUDA is not visible. Check the Slurm GPU "
+                "request and CUDA_VISIBLE_DEVICES, or use --mode cpu."
+            )
+        return None
+
+    if torch.cuda.is_available():
+        raise RuntimeError(
+            "CPU mode requested, but CUDA is still visible. Run this worker through "
+            "the v6 JSON launcher or set CUDA_VISIBLE_DEVICES='' before Python starts."
+        )
+    cpu_threads = resolve_cpu_threads()
+    torch.set_num_threads(cpu_threads)
+    torch.set_num_interop_threads(1)
+    return cpu_threads
+
+
+def model_device_type(cosyvoice) -> str:
+    device = getattr(cosyvoice.model, "device", None)
+    if device is None:
+        raise RuntimeError("Loaded CosyVoice model does not expose model.device")
+    return device.type
+
+
 def initialize_output_tsvs(
     output_tsv_path: Path,
     failed_tsv_path: Path,
@@ -270,12 +308,12 @@ def initialize_output_tsvs(
 def main() -> None:
     args = parse_args()
     model_dir = validate_model_args(args)
-    if args.batch_size <= 0:
-        raise ValueError("--batch_size must be positive")
-    llm_batch_size = args.llm_batch_size or args.batch_size
-    flow_batch_size = args.flow_batch_size or args.batch_size
-    if llm_batch_size <= 0 or flow_batch_size <= 0:
-        raise ValueError("--llm_batch_size and --flow_batch_size must be positive")
+    batch_size, llm_batch_size, flow_batch_size = resolve_batch_sizes(
+        args.mode,
+        args.batch_size,
+        args.llm_batch_size,
+        args.flow_batch_size,
+    )
     if args.min_token_text_ratio <= 0 or args.max_token_text_ratio <= 0:
         raise ValueError("--min_token_text_ratio and --max_token_text_ratio must be positive")
     if args.max_token_text_ratio < args.min_token_text_ratio:
@@ -284,6 +322,7 @@ def main() -> None:
         raise ValueError("--flow_n_timesteps must be positive")
     if args.save_workers <= 0:
         raise ValueError("--save_workers must be positive")
+    cpu_threads = configure_compute_runtime(args.mode)
 
     input_tsv_path = Path(args.input_tsv).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -291,10 +330,7 @@ def main() -> None:
     output_tsv_path = output_dir / args.output_tsv_name
     failed_tsv_path = output_dir / args.failed_tsv_name
 
-    rows = load_rows(
-        input_tsv_path,
-        require_ref_audio_text=args.model_version != "cosy2",
-    )
+    rows = load_rows(input_tsv_path)
     if not rows:
         raise ValueError(f"No valid rows found in input TSV: {input_tsv_path}")
     include_input_id = any(row.input_id is not None for row in rows)
@@ -350,6 +386,19 @@ def main() -> None:
             f"Loaded model class {actual_class_name}, expected {expected_class_name} "
             f"for --model_version {args.model_version}"
         )
+    actual_device_type = model_device_type(cosyvoice)
+    expected_device_type = "cuda" if args.mode == "gpu" else "cpu"
+    if actual_device_type != expected_device_type:
+        raise RuntimeError(
+            f"Requested --mode {args.mode}, but CosyVoice loaded on {actual_device_type}"
+        )
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK", "not-set")
+    print(
+        f"Runtime: mode={args.mode}, device={actual_device_type}, "
+        f"host={socket.gethostname()}, slurm_cpus_per_task={slurm_cpus}, "
+        f"torch_intraop_threads={cpu_threads if cpu_threads is not None else 'default'}, "
+        f"torch_interop_threads={1 if cpu_threads is not None else 'default'}"
+    )
     lang_token = (
         LANG_TOKEN_MAP[args.lang]
         if args.model_version == "cosy2" and args.lang
@@ -383,7 +432,7 @@ def main() -> None:
 
     try:
         for batch_index, row_batch in enumerate(
-            chunked(rows_to_process, args.batch_size),
+            chunked(rows_to_process, batch_size),
             start=1,
         ):
             batch_start_time = time.perf_counter()

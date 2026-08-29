@@ -56,10 +56,7 @@ def resolve_columns(fieldnames: Sequence[str]) -> Dict[str, str]:
     return column_mapping
 
 
-def load_rows(
-    input_tsv_path: Path,
-    require_ref_audio_text: bool = True,
-) -> List["TsvInputRow"]:
+def load_rows(input_tsv_path: Path) -> List["TsvInputRow"]:
     from batch_types import TsvInputRow
 
     rows: List["TsvInputRow"] = []
@@ -81,17 +78,10 @@ def load_rows(
             ref_audio_text = (
                 row.get(column_mapping["ref_audio_text"], "") or ""
             ).strip()
-            if not text or not ref_audio_path or (
-                require_ref_audio_text and not ref_audio_text
-            ):
+            if not text or not ref_audio_path or not ref_audio_text:
                 raise ValueError(
-                    f"Input TSV row {row_index} has an empty target text or "
-                    "reference audio path"
-                    + (
-                        ", or an empty reference audio text"
-                        if require_ref_audio_text
-                        else ""
-                    )
+                    f"Input TSV row {row_index} has an empty target text, "
+                    "reference audio path, or reference audio text"
                 )
             row_id = str(row_index)
             if "row_id" in column_mapping:

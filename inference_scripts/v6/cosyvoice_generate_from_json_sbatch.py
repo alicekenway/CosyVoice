@@ -21,6 +21,7 @@ from io_utils import (  # pylint: disable=wrong-import-position
     write_failures,
     write_metadata,
 )
+from runtime_utils import COMPUTE_MODES, resolve_batch_sizes  # pylint: disable=wrong-import-position
 
 
 TEXT_COLUMN = "text"
@@ -29,6 +30,8 @@ REFERENCE_AUDIO_TEXT_COLUMN = "reference_audio_text"
 INTERNAL_ID_COLUMN = "id"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant.<|endofprompt|>"
 MODEL_CONFIG_NAMES = {"cosy2": "cosyvoice2.yaml", "cosy3": "cosyvoice3.yaml"}
+DEFAULT_GPU_SBATCH_CMD = "sbatch --wait --gres=gpu:1 --ntasks=1"
+DEFAULT_CPU_SBATCH_CMD = "sbatch --wait --ntasks=1 --cpus-per-task=1 --mem=10G"
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Expand conversation JSON into text/reference candidates, launch "
-            "single-GPU CosyVoice chunk jobs, and write grouped JSON output."
+            "independent CPU or GPU CosyVoice chunk jobs, and write grouped JSON output."
         )
     )
 
@@ -138,8 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
-        help="Number of expanded text/reference rows processed per batch on each GPU",
+        default=None,
+        help="Rows processed per batch (default: 4 on GPU, 1 on CPU)",
     )
     parser.add_argument(
         "--llm_batch_size",
@@ -185,27 +188,39 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--mode",
+        choices=COMPUTE_MODES,
+        default="gpu",
+        help="Compute mode for every chunk job (default: gpu)",
+    )
+    parser.add_argument(
+        "--num_tasks",
+        type=int,
+        default=None,
+        help="Number of independent chunk jobs to launch",
+    )
+    parser.add_argument(
         "--num_gpus",
         type=int,
-        required=True,
-        help="Number of GPU chunk jobs to launch",
+        default=None,
+        help="Deprecated GPU-only alias for --num_tasks",
     )
     parser.add_argument(
         "--launcher",
         choices=["sbatch", "local"],
         default="sbatch",
         help=(
-            "How to launch each chunk. sbatch submits independent GPU jobs; "
+            "How to launch each chunk. sbatch submits independent jobs; "
             "local runs chunk scripts directly for debugging."
         ),
     )
     parser.add_argument(
         "--sbatch_cmd",
-        default="sbatch --wait --gres=gpu:1 --ntasks=1",
+        default=None,
         help=(
             "sbatch command prefix for each chunk, quoted as one string. "
             "The wrapper adds per-chunk --output/--error paths and the chunk "
-            "script path. --wait is added automatically if omitted."
+            "script path. --wait and --ntasks=1 are added automatically if omitted."
         ),
     )
     parser.add_argument(
@@ -275,14 +290,13 @@ def validate_args(args: argparse.Namespace) -> None:
             f"--model_version {args.model_version} requires {expected_config.name} "
             f"inside --model_path, but it was not found: {model_dir}"
         )
-    if args.num_gpus <= 0:
-        raise ValueError("--num_gpus must be positive")
-    if args.batch_size <= 0:
-        raise ValueError("--batch_size must be positive")
-    llm_batch_size = args.llm_batch_size or args.batch_size
-    flow_batch_size = args.flow_batch_size or args.batch_size
-    if llm_batch_size <= 0 or flow_batch_size <= 0:
-        raise ValueError("--llm_batch_size and --flow_batch_size must be positive")
+    resolve_task_count(args)
+    resolve_batch_sizes(
+        args.mode,
+        args.batch_size,
+        args.llm_batch_size,
+        args.flow_batch_size,
+    )
     if args.min_token_text_ratio <= 0 or args.max_token_text_ratio <= 0:
         raise ValueError("--min_token_text_ratio and --max_token_text_ratio must be positive")
     if args.max_token_text_ratio < args.min_token_text_ratio:
@@ -295,6 +309,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--poll_interval_sec must be positive")
     if not args.python_cmd.strip():
         raise ValueError("--python_cmd must not be empty")
+    if args.launcher == "sbatch":
+        sbatch_prefix(args)
+
+
+def resolve_task_count(args: argparse.Namespace) -> int:
+    if args.num_tasks is not None and args.num_gpus is not None:
+        raise ValueError("Use --num_tasks or deprecated --num_gpus, not both")
+    if args.num_gpus is not None:
+        if args.mode != "gpu":
+            raise ValueError("--num_gpus is only valid with --mode gpu")
+        task_count = args.num_gpus
+    else:
+        task_count = args.num_tasks
+    if task_count is None:
+        raise ValueError("--num_tasks is required (or use deprecated --num_gpus in GPU mode)")
+    if task_count <= 0:
+        raise ValueError("--num_tasks must be positive")
+    return task_count
 
 
 def require_string_list(value, record_index: int, field_name: str) -> List[str]:
@@ -317,10 +349,7 @@ def require_string_list(value, record_index: int, field_name: str) -> List[str]:
     return output
 
 
-def load_input_conversations(
-    input_json_path: Path,
-    model_version: str = "cosy3",
-) -> List[InputConversation]:
+def load_input_conversations(input_json_path: Path) -> List[InputConversation]:
     with input_json_path.open("r", encoding="utf-8") as input_file:
         payload = json.load(input_file)
     if not isinstance(payload, list):
@@ -341,18 +370,11 @@ def load_input_conversations(
             record_index,
             "reference_audio_path",
         )
-        raw_reference_audio_texts = record.get("reference_audio_text")
-        if raw_reference_audio_texts is None and model_version == "cosy2":
-            # CosyVoice2 supports cross-lingual prompting without a reference
-            # transcript. Keep one empty value per reference so candidate
-            # expansion remains aligned with reference_audio_path.
-            reference_audio_texts = [""] * len(reference_audio_paths)
-        else:
-            reference_audio_texts = require_string_list(
-                raw_reference_audio_texts,
-                record_index,
-                "reference_audio_text",
-            )
+        reference_audio_texts = require_string_list(
+            record.get("reference_audio_text"),
+            record_index,
+            "reference_audio_text",
+        )
         if len(reference_audio_paths) != len(reference_audio_texts):
             raise ValueError(
                 f"Record {record_index} reference_audio_path and "
@@ -468,8 +490,12 @@ def setup_lines(args: argparse.Namespace) -> List[str]:
 
 
 def child_command(args: argparse.Namespace, chunk_input_path: Path, chunk_dir: Path) -> List[str]:
-    llm_batch_size = args.llm_batch_size or args.batch_size
-    flow_batch_size = args.flow_batch_size or args.batch_size
+    batch_size, llm_batch_size, flow_batch_size = resolve_batch_sizes(
+        args.mode,
+        args.batch_size,
+        args.llm_batch_size,
+        args.flow_batch_size,
+    )
     command = [
         *shlex.split(args.python_cmd),
         str(CURRENT_DIR / "cosyvoice_generate_from_tsv_batch.py"),
@@ -477,6 +503,8 @@ def child_command(args: argparse.Namespace, chunk_input_path: Path, chunk_dir: P
         str(Path(args.model_path).expanduser().resolve()),
         "--model_version",
         args.model_version,
+        "--mode",
+        args.mode,
         "--input_tsv",
         str(chunk_input_path),
         "--output_dir",
@@ -486,7 +514,7 @@ def child_command(args: argparse.Namespace, chunk_input_path: Path, chunk_dir: P
         "--failed_tsv_name",
         args.failed_tsv_name,
         "--batch_size",
-        str(args.batch_size),
+        str(batch_size),
         "--llm_batch_size",
         str(llm_batch_size),
         "--flow_batch_size",
@@ -517,6 +545,7 @@ def write_run_script(
     run_script_path: Path,
     setup_commands: Sequence[str],
     command: Sequence[str],
+    mode: str,
 ) -> None:
     lines = [
         "#!/usr/bin/env bash",
@@ -524,6 +553,22 @@ def write_run_script(
         f"cd {shlex.quote(str(CURRENT_DIR))}",
     ]
     lines.extend(setup_commands)
+    if mode == "cpu":
+        lines.extend(
+            [
+                'export CUDA_VISIBLE_DEVICES=""',
+                'COSYVOICE_CPU_THREADS="${SLURM_CPUS_PER_TASK:-1}"',
+                'if ! [[ "$COSYVOICE_CPU_THREADS" =~ ^[1-9][0-9]*$ ]]; then',
+                '  echo "Invalid CPU thread count: $COSYVOICE_CPU_THREADS" >&2',
+                "  exit 2",
+                "fi",
+                "export COSYVOICE_CPU_THREADS",
+                'export OMP_NUM_THREADS="$COSYVOICE_CPU_THREADS"',
+                'export MKL_NUM_THREADS="$COSYVOICE_CPU_THREADS"',
+                'export OPENBLAS_NUM_THREADS="$COSYVOICE_CPU_THREADS"',
+                'export NUMEXPR_NUM_THREADS="$COSYVOICE_CPU_THREADS"',
+            ]
+        )
     lines.append(f"exec {shlex.join(command)}")
     run_script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     run_script_path.chmod(0o755)
@@ -551,7 +596,7 @@ def build_jobs(
 
         write_chunk_tsv(input_tsv_path, candidates)
         command = child_command(args, input_tsv_path, chunk_dir)
-        write_run_script(run_script_path, commands, command)
+        write_run_script(run_script_path, commands, command, args.mode)
 
         jobs.append(
             ChunkJob(
@@ -628,20 +673,57 @@ def has_long_option(tokens: Sequence[str], option_name: str) -> bool:
     return any(token == option_name or token.startswith(f"{option_name}=") for token in tokens)
 
 
-def sbatch_prefix(sbatch_cmd: str) -> List[str]:
-    prefix = split_command(sbatch_cmd)
+def slurm_option_values(
+    tokens: Sequence[str],
+    long_option: str,
+    short_option: str,
+) -> List[str]:
+    values: List[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == long_option or token == short_option:
+            if index + 1 >= len(tokens):
+                raise ValueError(f"{token} requires a value in --sbatch_cmd")
+            values.append(tokens[index + 1])
+            index += 2
+            continue
+        if token.startswith(f"{long_option}="):
+            values.append(token.split("=", 1)[1])
+        elif token.startswith(short_option) and token != short_option:
+            values.append(token[len(short_option):])
+        index += 1
+    return values
+
+
+def sbatch_prefix(args: argparse.Namespace) -> List[str]:
+    default_command = (
+        DEFAULT_CPU_SBATCH_CMD if args.mode == "cpu" else DEFAULT_GPU_SBATCH_CMD
+    )
+    command = default_command if args.sbatch_cmd is None else args.sbatch_cmd
+    prefix = split_command(command)
     if not prefix:
         raise ValueError("--sbatch_cmd must not be empty when --launcher sbatch is used")
     if not has_long_option(prefix, "--wait"):
         prefix.append("--wait")
+    task_values = slurm_option_values(prefix, "--ntasks", "-n")
+    if not task_values:
+        prefix.append("--ntasks=1")
+    elif any(value != "1" for value in task_values):
+        raise ValueError(
+            "Each chunk is one process, so --sbatch_cmd must use --ntasks=1; "
+            "use --num_tasks to control the number of independent chunk jobs"
+        )
     return prefix
 
 
 def launch_command_for_job(args: argparse.Namespace, job: ChunkJob) -> List[str]:
     if args.launcher == "sbatch":
-        prefix = sbatch_prefix(args.sbatch_cmd)
+        prefix = sbatch_prefix(args)
         if not has_long_option(prefix, "--job-name"):
-            prefix.extend(["--job-name", f"cosyvoice_v4_chunk_{job.index:04d}"])
+            prefix.extend(
+                ["--job-name", f"cosyvoice_v6_{args.mode}_chunk_{job.index:04d}"]
+            )
         return [
             *prefix,
             "--output",
@@ -922,18 +1004,27 @@ def refresh_grouped_json_outputs(
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.num_gpus is not None:
+        print("Warning: --num_gpus is deprecated; use --num_tasks instead.")
 
     input_json_path = Path(args.input_json).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    conversations = load_input_conversations(input_json_path, args.model_version)
+    conversations = load_input_conversations(input_json_path)
     candidates = expand_conversations(conversations)
     candidates_by_id = {candidate.candidate_id: candidate for candidate in candidates}
-    chunks = split_items(candidates, args.num_gpus)
-    if len(chunks) < args.num_gpus:
+    task_count = resolve_task_count(args)
+    batch_size, llm_batch_size, flow_batch_size = resolve_batch_sizes(
+        args.mode,
+        args.batch_size,
+        args.llm_batch_size,
+        args.flow_batch_size,
+    )
+    chunks = split_items(candidates, task_count)
+    if len(chunks) < task_count:
         print(
-            f"Requested {args.num_gpus} GPU chunks but only {len(candidates)} "
+            f"Requested {task_count} {args.mode.upper()} chunks but only {len(candidates)} "
             f"expanded candidates exist; launching {len(chunks)} chunks."
         )
 
@@ -941,6 +1032,11 @@ def main() -> None:
     jobs = build_jobs(args, chunks, output_dir)
     print(f"Input records: {len(conversations)}")
     print(f"Expanded candidates: {len(candidates)}")
+    print(f"Compute mode: {args.mode}")
+    print(
+        "Batch sizes: "
+        f"outer={batch_size}, llm={llm_batch_size}, flow={flow_batch_size}"
+    )
     print(f"Chunk jobs: {len(jobs)}")
     print(f"Chunk root: {output_dir / args.chunk_dir_name}")
 

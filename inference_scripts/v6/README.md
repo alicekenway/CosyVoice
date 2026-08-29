@@ -1,16 +1,13 @@
-# CosyVoice v5 Transcript-Conditioned Voice Cloning
+# CosyVoice v6 Transcript-Conditioned Voice Cloning
 
 This directory provides staged batch inference for CosyVoice 2 and CosyVoice 3.
-An aligned reference transcript selects the official zero-shot voice-cloning
-prompt path. CosyVoice2 can instead omit `reference_audio_text` to use its
-cross-lingual prompt path. CosyVoice3 always requires aligned transcripts.
+Every reference audio must have an aligned transcript so the LLM can use the
+official zero-shot voice-cloning prompt path.
 
 ## Input JSON
 
-The JSON launcher accepts a top-level list. `reference_audio_path` must be a
-non-empty list. When `reference_audio_text` is supplied, it must be a non-empty
-aligned list of equal length. It may be omitted only with
-`--model_version cosy2`.
+The JSON launcher accepts a top-level list. `reference_audio_path` and
+`reference_audio_text` must be non-empty aligned lists of equal length.
 
 ```json
 [
@@ -71,8 +68,9 @@ python3 cosyvoice_generate_from_json_sbatch.py \
   --input_json /path/to/input.json \
   --output_dir /path/to/output_cosy2 \
   --lang zh \
+  --mode gpu \
   --batch_size 4 \
-  --num_gpus 1 \
+  --num_tasks 1 \
   --launcher local
 ```
 
@@ -93,8 +91,9 @@ python3 cosyvoice_generate_from_json_sbatch.py \
   --model_version cosy3 \
   --input_json /path/to/input.json \
   --output_dir /path/to/output_cosy3 \
+  --mode gpu \
   --batch_size 4 \
-  --num_gpus 1 \
+  --num_tasks 1 \
   --launcher local
 ```
 
@@ -102,7 +101,11 @@ Passing `--lang` with `--model_version cosy3` is an error.
 
 ## Slurm Launch
 
-The JSON launcher can submit one independent job per GPU:
+The JSON launcher uses the same independent-chunk mechanism on GPU and CPU.
+`--num_tasks` controls the number of chunks and independent Slurm jobs; each
+chunk job itself always uses `--ntasks=1`.
+
+### GPU mode
 
 ```bash
 python3 cosyvoice_generate_from_json_sbatch.py \
@@ -110,10 +113,11 @@ python3 cosyvoice_generate_from_json_sbatch.py \
   --model_version cosy3 \
   --input_json /path/to/input.json \
   --output_dir /path/to/output \
+  --mode gpu \
   --batch_size 4 \
   --llm_batch_size 4 \
   --flow_batch_size 4 \
-  --num_gpus 4 \
+  --num_tasks 4 \
   --launcher sbatch \
   --sbatch_cmd 'sbatch --wait --partition=gpu --gres=gpu:1 --ntasks=1 --cpus-per-task=5 --mem=30GB' \
   --conda_sh /path/to/conda.sh \
@@ -121,11 +125,43 @@ python3 cosyvoice_generate_from_json_sbatch.py \
 ```
 
 When the launcher itself is already inside an `srun` allocation, use
-`--launcher local --num_gpus 1` so the child worker inherits that GPU.
+`--launcher local --mode gpu --num_tasks 1` so the child worker inherits that
+GPU. `--num_gpus` remains available as a deprecated GPU-only alias for
+`--num_tasks`.
+
+### CPU mode
+
+CPU mode disables CUDA before each worker starts and fixes all inference batch
+sizes at one. Each worker reads `SLURM_CPUS_PER_TASK` and uses that many
+PyTorch intra-op threads; PyTorch inter-op and ONNX frontend execution remain
+single-threaded.
+
+```bash
+python3 cosyvoice_generate_from_json_sbatch.py \
+  --model_path /path/to/CosyVoice3-0.5B \
+  --model_version cosy3 \
+  --input_json /path/to/input.json \
+  --output_dir /path/to/output_cpu \
+  --mode cpu \
+  --num_tasks 150 \
+  --launcher sbatch \
+  --sbatch_cmd 'sbatch --wait --partition=cpu --ntasks=1 --cpus-per-task=1 --mem=10G --time=04:00:00' \
+  --conda_sh /path/to/conda.sh \
+  --conda_env cosy
+```
+
+To give every independent chunk more inference threads, change
+`--cpus-per-task`, for example to four. Do not change `--ntasks=1`; use
+`--num_tasks` to change the number of independent chunk jobs. Memory,
+partition, account, time, constraints, and other Slurm settings remain
+configurable through `--sbatch_cmd`.
+
+When `--sbatch_cmd` is omitted, GPU mode requests one GPU and CPU mode requests
+one CPU plus 10 GiB of memory per chunk.
 
 ## Outputs
 
-Given `--output_dir /path/to/output`, v5 writes:
+Given `--output_dir /path/to/output`, v6 writes:
 
 ```text
 /path/to/output/
@@ -172,11 +208,11 @@ reference path, reference transcript, and error message.
 
 ## Validation
 
-Run the focused v5 tests and syntax checks from the repository root:
+Run the focused v6 tests and syntax checks from the repository root:
 
 ```bash
-python3 -m unittest discover -s inference_scripts/v5/tests -v
+python3 -m unittest discover -s inference_scripts/v6/tests -v
 python3 -m py_compile \
-  inference_scripts/v5/*.py \
+  inference_scripts/v6/*.py \
   inference_scripts/infer_tools/prepare_cosyvoice_tsv_v5.py
 ```

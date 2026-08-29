@@ -156,37 +156,21 @@ class ZeroShotBatchPreparer:
         if not normalized_texts:
             raise RuntimeError(f"Text normalization returned empty segments: row_id={row.row_id}")
 
-        if row.ref_audio_text:
-            prompt_text_value = row.ref_audio_text
-            if self.model_version == "cosy3":
-                prompt_text_value = f"{self.system_prompt}{prompt_text_value}"
-            normalized_prompt_text = self.frontend.text_normalize(
-                prompt_text_value,
-                split=False,
-                text_frontend=self.text_frontend,
-            )
-            if not normalized_prompt_text:
-                raise RuntimeError(
-                    f"Reference transcript is empty: row_id={row.row_id}"
-                )
-            prompt_text, prompt_text_len = self.frontend._extract_text_token(
-                normalized_prompt_text
-            )
-        elif self.model_version == "cosy2":
-            # Match CosyVoice2 frontend_cross_lingual: retain the reference
-            # audio for flow/speaker conditioning, but omit reference text and
-            # reference speech tokens from the LLM prompt.
-            prompt_text = torch.zeros((1, 0), dtype=torch.int32)
-            prompt_text_len = torch.zeros((1,), dtype=torch.int32)
-        else:
+        prompt_text_value = row.ref_audio_text
+        if self.model_version == "cosy3":
+            prompt_text_value = f"{self.system_prompt}{prompt_text_value}"
+        normalized_prompt_text = self.frontend.text_normalize(
+            prompt_text_value,
+            split=False,
+            text_frontend=self.text_frontend,
+        )
+        if not normalized_prompt_text:
             raise RuntimeError(f"Reference transcript is empty: row_id={row.row_id}")
+        prompt_text, prompt_text_len = self.frontend._extract_text_token(
+            normalized_prompt_text
+        )
 
         prompt_features = self._get_prompt_features(row.ref_audio_path)
-        llm_prompt_speech_token = prompt_features.llm_prompt_speech_token
-        llm_prompt_speech_token_len = prompt_features.llm_prompt_speech_token_len
-        if not row.ref_audio_text:
-            llm_prompt_speech_token = llm_prompt_speech_token[:, :0]
-            llm_prompt_speech_token_len = llm_prompt_speech_token_len.new_zeros((1,))
         segment_inputs: List[SegmentInput] = []
         for normalized_text in normalized_texts:
             text, text_len = self.frontend._extract_text_token(normalized_text)
@@ -195,8 +179,8 @@ class ZeroShotBatchPreparer:
                 "text_len": text_len,
                 "prompt_text": prompt_text,
                 "prompt_text_len": prompt_text_len,
-                "llm_prompt_speech_token": llm_prompt_speech_token,
-                "llm_prompt_speech_token_len": llm_prompt_speech_token_len,
+                "llm_prompt_speech_token": prompt_features.llm_prompt_speech_token,
+                "llm_prompt_speech_token_len": prompt_features.llm_prompt_speech_token_len,
                 "flow_prompt_speech_token": prompt_features.flow_prompt_speech_token,
                 "flow_prompt_speech_token_len": prompt_features.flow_prompt_speech_token_len,
                 "prompt_speech_feat": prompt_features.prompt_speech_feat,

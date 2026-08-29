@@ -9,25 +9,29 @@ import warnings
 import torch
 
 
-V5_DIR = Path(__file__).resolve().parents[1]
-INFER_TOOLS_DIR = V5_DIR.parent / "infer_tools"
-for import_dir in (str(V5_DIR), str(INFER_TOOLS_DIR)):
+V6_DIR = Path(__file__).resolve().parents[1]
+INFER_TOOLS_DIR = V6_DIR.parent / "infer_tools"
+for import_dir in (str(V6_DIR), str(INFER_TOOLS_DIR)):
     if import_dir not in sys.path:
         sys.path.insert(0, import_dir)
 
 from batch_types import TsvInputRow  # noqa: E402
 from cosyvoice_generate_from_json_sbatch import (  # noqa: E402
+    child_command,
     expand_conversations,
     load_input_conversations,
+    resolve_task_count,
+    sbatch_prefix,
+    write_run_script,
 )
 from frontend_batch import ZeroShotBatchPreparer  # noqa: E402
-from io_utils import load_rows  # noqa: E402
 from prepare_cosyvoice_tsv_v5 import (  # noqa: E402
     attach_references,
     build_text_file_records,
     load_audio_references,
 )
 from staged_inference import StagedBatchInferenceRunner  # noqa: E402
+from runtime_utils import resolve_batch_sizes, resolve_cpu_threads  # noqa: E402
 
 
 class FakeFrontend:
@@ -62,7 +66,7 @@ class FakeFrontend:
         return torch.zeros(1, 192)
 
 
-class V5PreparationTests(unittest.TestCase):
+class V6PreparationTests(unittest.TestCase):
     def test_audio_path_and_transcript_pairs_stay_aligned(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -141,63 +145,8 @@ class V5PreparationTests(unittest.TestCase):
                 [("a.wav", "甲"), ("b.wav", "乙"), ("a.wav", "甲"), ("b.wav", "乙")],
             )
 
-    def test_cosy2_allows_missing_reference_transcripts(self):
-        with TemporaryDirectory() as temp_dir:
-            input_json = Path(temp_dir) / "input.json"
-            input_json.write_text(
-                json.dumps(
-                    [
-                        {
-                            "id": "x",
-                            "text": ["target"],
-                            "reference_audio_path": ["a.wav", "b.wav"],
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            conversations = load_input_conversations(input_json, "cosy2")
-            self.assertEqual(conversations[0].reference_audio_texts, ["", ""])
-            candidates = expand_conversations(conversations)
-            self.assertEqual(
-                [item.reference_audio_text for item in candidates],
-                ["", ""],
-            )
 
-    def test_cosy3_still_requires_reference_transcripts(self):
-        with TemporaryDirectory() as temp_dir:
-            input_json = Path(temp_dir) / "input.json"
-            input_json.write_text(
-                json.dumps(
-                    [
-                        {
-                            "id": "x",
-                            "text": ["target"],
-                            "reference_audio_path": ["a.wav"],
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "must be a list"):
-                load_input_conversations(input_json, "cosy3")
-
-    def test_tsv_loader_allows_empty_reference_text_only_when_requested(self):
-        with TemporaryDirectory() as temp_dir:
-            input_tsv = Path(temp_dir) / "input.tsv"
-            input_tsv.write_text(
-                "text\treference_audio_path\treference_audio_text\n"
-                "target\treference.wav\t\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "reference audio text"):
-                load_rows(input_tsv)
-            rows = load_rows(input_tsv, require_ref_audio_text=False)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].ref_audio_text, "")
-
-
-class V5FrontendTests(unittest.TestCase):
+class V6FrontendTests(unittest.TestCase):
     @staticmethod
     def _row():
         return TsvInputRow(
@@ -239,33 +188,8 @@ class V5FrontendTests(unittest.TestCase):
         self.assertIn(system_prompt + "参考转写", frontend.tokenized)
         self.assertFalse(prepared.text_for_metadata.startswith("<|"))
 
-    def test_cosy2_without_reference_text_uses_cross_lingual_prompt(self):
-        frontend = FakeFrontend()
-        preparer = ZeroShotBatchPreparer(
-            frontend=frontend,
-            sample_rate=24000,
-            text_frontend=False,
-            model_version="cosy2",
-            lang_token="<|en|>",
-            system_prompt="unused",
-        )
-        row = TsvInputRow(
-            output_index=0,
-            row_id="row-1",
-            text="target text",
-            ref_audio_path="reference.wav",
-            ref_audio_text="",
-        )
-        model_input = preparer.prepare_rows([row])[0].segment_inputs[0].model_input
-        self.assertEqual(model_input["prompt_text"].numel(), 0)
-        self.assertEqual(model_input["prompt_text_len"].item(), 0)
-        self.assertEqual(model_input["llm_prompt_speech_token"].numel(), 0)
-        self.assertEqual(model_input["llm_prompt_speech_token_len"].item(), 0)
-        self.assertGreater(model_input["flow_prompt_speech_token"].numel(), 0)
-        self.assertNotIn("", frontend.tokenized)
 
-
-class V5FlowTests(unittest.TestCase):
+class V6FlowTests(unittest.TestCase):
     def test_cosy3_prelookahead_flow_is_upsampled(self):
         class Cosy3Flow:
             token_mel_ratio = 2
@@ -306,7 +230,7 @@ class V5FlowTests(unittest.TestCase):
         self.assertEqual(mel_len.tolist(), [6])
 
 
-class V5LlmPrefixTests(unittest.TestCase):
+class V6LlmPrefixTests(unittest.TestCase):
     def test_zero_shot_prefix_includes_prompt_text_and_prompt_speech(self):
         frontend = FakeFrontend()
         preparer = ZeroShotBatchPreparer(
@@ -317,7 +241,7 @@ class V5LlmPrefixTests(unittest.TestCase):
             lang_token="",
             system_prompt="You are a helpful assistant.<|endofprompt|>",
         )
-        model_input = preparer.prepare_rows([V5FrontendTests._row()])[0].segment_inputs[
+        model_input = preparer.prepare_rows([V6FrontendTests._row()])[0].segment_inputs[
             0
         ].model_input
 
@@ -373,6 +297,112 @@ class V5LlmPrefixTests(unittest.TestCase):
             + int(model_input["llm_prompt_speech_token_len"].item())
         )
         self.assertEqual(runner.captured_prefixes[0].shape[0], expected_length)
+
+
+class V6ComputeModeTests(unittest.TestCase):
+    def test_gpu_and_cpu_batch_defaults(self):
+        self.assertEqual(resolve_batch_sizes("gpu", None, None, None), (4, 4, 4))
+        self.assertEqual(resolve_batch_sizes("cpu", None, None, None), (1, 1, 1))
+
+    def test_cpu_mode_rejects_batching(self):
+        with self.assertRaisesRegex(ValueError, "only supports batch size 1"):
+            resolve_batch_sizes("cpu", 2, None, None)
+        with self.assertRaisesRegex(ValueError, "only supports batch size 1"):
+            resolve_batch_sizes("cpu", 1, 2, 1)
+
+    def test_cpu_threads_prefer_launcher_value_then_slurm(self):
+        self.assertEqual(
+            resolve_cpu_threads(
+                {"COSYVOICE_CPU_THREADS": "4", "SLURM_CPUS_PER_TASK": "2"}
+            ),
+            4,
+        )
+        self.assertEqual(resolve_cpu_threads({"SLURM_CPUS_PER_TASK": "2"}), 2)
+        self.assertEqual(resolve_cpu_threads({}), 1)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            resolve_cpu_threads({"SLURM_CPUS_PER_TASK": "many"})
+
+    def test_task_count_uses_common_option_and_gpu_alias(self):
+        self.assertEqual(
+            resolve_task_count(SimpleNamespace(mode="cpu", num_tasks=8, num_gpus=None)),
+            8,
+        )
+        self.assertEqual(
+            resolve_task_count(SimpleNamespace(mode="gpu", num_tasks=None, num_gpus=2)),
+            2,
+        )
+        with self.assertRaisesRegex(ValueError, "not both"):
+            resolve_task_count(SimpleNamespace(mode="gpu", num_tasks=2, num_gpus=2))
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            resolve_task_count(SimpleNamespace(mode="cpu", num_tasks=None, num_gpus=2))
+
+    def test_sbatch_defaults_are_mode_specific_and_single_task(self):
+        cpu_prefix = sbatch_prefix(SimpleNamespace(mode="cpu", sbatch_cmd=None))
+        gpu_prefix = sbatch_prefix(SimpleNamespace(mode="gpu", sbatch_cmd=None))
+        self.assertIn("--cpus-per-task=1", cpu_prefix)
+        self.assertIn("--mem=10G", cpu_prefix)
+        self.assertNotIn("--gres=gpu:1", cpu_prefix)
+        self.assertIn("--gres=gpu:1", gpu_prefix)
+        self.assertIn("--ntasks=1", cpu_prefix)
+        self.assertIn("--ntasks=1", gpu_prefix)
+
+    def test_custom_sbatch_command_is_preserved_and_validated(self):
+        args = SimpleNamespace(
+            mode="cpu",
+            sbatch_cmd=(
+                "sbatch --partition=cpu --cpus-per-task=4 --mem=12G --time=01:00:00"
+            ),
+        )
+        prefix = sbatch_prefix(args)
+        self.assertIn("--partition=cpu", prefix)
+        self.assertIn("--cpus-per-task=4", prefix)
+        self.assertIn("--mem=12G", prefix)
+        self.assertIn("--wait", prefix)
+        self.assertIn("--ntasks=1", prefix)
+        with self.assertRaisesRegex(ValueError, "must use --ntasks=1"):
+            sbatch_prefix(SimpleNamespace(mode="cpu", sbatch_cmd="sbatch --ntasks=2"))
+
+    def test_cpu_run_script_caps_threads_and_hides_cuda(self):
+        with TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "run.sh"
+            write_run_script(
+                script_path,
+                ["source /tmp/conda.sh"],
+                ["python3", "worker.py"],
+                "cpu",
+            )
+            script = script_path.read_text(encoding="utf-8")
+        self.assertIn('export CUDA_VISIBLE_DEVICES=""', script)
+        self.assertIn('SLURM_CPUS_PER_TASK:-1', script)
+        self.assertIn('export OMP_NUM_THREADS="$COSYVOICE_CPU_THREADS"', script)
+        self.assertIn('export MKL_NUM_THREADS="$COSYVOICE_CPU_THREADS"', script)
+
+    def test_cpu_child_command_passes_mode_and_unit_batches(self):
+        args = SimpleNamespace(
+            python_cmd="python3",
+            model_path="/tmp/model",
+            model_version="cosy3",
+            mode="cpu",
+            output_tsv_name="generated.tsv",
+            failed_tsv_name="failed.tsv",
+            batch_size=None,
+            llm_batch_size=None,
+            flow_batch_size=None,
+            min_token_text_ratio=2.0,
+            max_token_text_ratio=20.0,
+            flow_n_timesteps=10,
+            on_error="skip",
+            save_workers=1,
+            text_frontend=False,
+            lang=None,
+            system_prompt="You are a helpful assistant.<|endofprompt|>",
+            overwrite=False,
+        )
+        command = child_command(args, Path("input.tsv"), Path("chunk"))
+        self.assertEqual(command[command.index("--mode") + 1], "cpu")
+        self.assertEqual(command[command.index("--batch_size") + 1], "1")
+        self.assertEqual(command[command.index("--llm_batch_size") + 1], "1")
+        self.assertEqual(command[command.index("--flow_batch_size") + 1], "1")
 
 if __name__ == "__main__":
     unittest.main()
